@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
 	"tailscale.com/net/netns"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/monitor"
@@ -133,8 +135,8 @@ type route struct {
 // resolverAndDelay is an upstream DNS resolver and a delay for how
 // long to wait before querying it.
 type resolverAndDelay struct {
-	// ipp is the upstream resolver.
-	ipp netaddr.IPPort
+	// name is the upstream resolver.
+	name dnstype.Resolver
 
 	// startDelay is an amount to delay this resolver at
 	// start. It's used when, say, there are four Google or
@@ -158,7 +160,7 @@ type forwarder struct {
 
 	mu sync.Mutex // guards following
 
-	dohClient map[netaddr.IP]*http.Client
+	dohClient map[string]*http.Client // urlBase -> client
 
 	// routes are per-suffix resolvers to use, with
 	// the most specific routes first.
@@ -192,11 +194,11 @@ func (f *forwarder) Close() error {
 	return nil
 }
 
-// resolversWithDelays maps from a set of DNS server ip:ports (currently
-// the port is always 53) to a slice of a type that included a
-// startDelay. So if ipps contains e.g. four Google DNS IPs (two IPv4
-// + twoIPv6), this function partition adds delays to some.
-func resolversWithDelays(ipps []netaddr.IPPort) []resolverAndDelay {
+// resolversWithDelays maps from a set of DNS server names to a slice of
+// a type that included a startDelay. So if ipps contains e.g. four
+// Google DNS IPs (two IPv4 + twoIPv6), this function partition adds
+// delays to some.
+func resolversWithDelays(resolvers []dnstype.Resolver) []resolverAndDelay {
 	type hostAndFam struct {
 		host string // some arbitrary string representing DNS host (currently the DoH base)
 		bits uint8  // either 32 or 128 for IPv4 vs IPv6s address family
@@ -206,47 +208,49 @@ func resolversWithDelays(ipps []netaddr.IPPort) []resolverAndDelay {
 	// per address family.
 	total := map[hostAndFam]int{}
 
-	rr := make([]resolverAndDelay, len(ipps))
-	for _, ipp := range ipps {
-		ip := ipp.IP()
-		if host, ok := knownDoH[ip]; ok {
-			total[hostAndFam{host, ip.BitLen()}]++
+	rr := make([]resolverAndDelay, len(resolvers))
+	for _, r := range resolvers {
+		if ip, err := netaddr.ParseIP(r.Addr); err == nil {
+			if host, ok := knownDoH[ip]; ok {
+				total[hostAndFam{host, ip.BitLen()}]++
+			}
 		}
 	}
 
 	done := map[hostAndFam]int{}
-	for i, ipp := range ipps {
-		ip := ipp.IP()
+	for i, r := range resolvers {
 		var startDelay time.Duration
-		if host, ok := knownDoH[ip]; ok {
-			key4 := hostAndFam{host, 32}
-			key6 := hostAndFam{host, 128}
-			switch {
-			case ip.Is4():
-				if done[key4] > 0 {
-					startDelay += wellKnownHostBackupDelay
+		if ip, err := netaddr.ParseIP(r.Addr); err == nil {
+			if host, ok := knownDoH[ip]; ok {
+				key4 := hostAndFam{host, 32}
+				key6 := hostAndFam{host, 128}
+				switch {
+				case ip.Is4():
+					if done[key4] > 0 {
+						startDelay += wellKnownHostBackupDelay
+					}
+				case ip.Is6():
+					total4 := total[key4]
+					if total4 >= 2 {
+						// If we have two IPv4 IPs of the same provider
+						// already in the set, delay the IPv6 queries
+						// until halfway through the timeout (so wait
+						// 2.5 seconds). Even the network is IPv6-only,
+						// the DoH dialer will fallback to IPv6
+						// immediately anyway.
+						startDelay = responseTimeout / 2
+					} else if total4 == 1 {
+						startDelay += wellKnownHostBackupDelay
+					}
+					if done[key6] > 0 {
+						startDelay += wellKnownHostBackupDelay
+					}
 				}
-			case ip.Is6():
-				total4 := total[key4]
-				if total4 >= 2 {
-					// If we have two IPv4 IPs of the same provider
-					// already in the set, delay the IPv6 queries
-					// until halfway through the timeout (so wait
-					// 2.5 seconds). Even the network is IPv6-only,
-					// the DoH dialer will fallback to IPv6
-					// immediately anyway.
-					startDelay = responseTimeout / 2
-				} else if total4 == 1 {
-					startDelay += wellKnownHostBackupDelay
-				}
-				if done[key6] > 0 {
-					startDelay += wellKnownHostBackupDelay
-				}
+				done[hostAndFam{host, ip.BitLen()}]++
 			}
-			done[hostAndFam{host, ip.BitLen()}]++
 		}
 		rr[i] = resolverAndDelay{
-			ipp:        ipp,
+			name:       r,
 			startDelay: startDelay,
 		}
 	}
@@ -257,12 +261,12 @@ func resolversWithDelays(ipps []netaddr.IPPort) []resolverAndDelay {
 // Resolver.SetConfig on reconfig.
 //
 // The memory referenced by routesBySuffix should not be modified.
-func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]netaddr.IPPort) {
+func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]dnstype.Resolver) {
 	routes := make([]route, 0, len(routesBySuffix))
-	for suffix, ipps := range routesBySuffix {
+	for suffix, rs := range routesBySuffix {
 		routes = append(routes, route{
 			Suffix:    suffix,
-			Resolvers: resolversWithDelays(ipps),
+			Resolvers: resolversWithDelays(rs),
 		})
 	}
 	// Sort from longest prefix to shortest.
@@ -296,18 +300,35 @@ func (f *forwarder) packetListener(ip netaddr.IP) (packetListener, error) {
 	return lc, nil
 }
 
-func (f *forwarder) getDoHClient(ip netaddr.IP) (urlBase string, c *http.Client, ok bool) {
+func (f *forwarder) getKnownDoHClient(ip netaddr.IP) (urlBase string, c *http.Client, ok bool) {
 	urlBase, ok = knownDoH[ip]
 	if !ok {
 		return
 	}
+	c, err := f.getDoHClient(urlBase, nil)
+	if err != nil {
+		return "", nil, false
+	}
+	return urlBase, c, ok
+}
+
+func (f *forwarder) getDoHClient(urlBase string, bootstrapRes []netaddr.IP) (c *http.Client, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if c, ok := f.dohClient[ip]; ok {
-		return urlBase, c, true
+	if c, ok := f.dohClient[urlBase]; ok {
+		return c, nil
 	}
 	if f.dohClient == nil {
-		f.dohClient = map[netaddr.IP]*http.Client{}
+		f.dohClient = map[string]*http.Client{}
+	}
+	dohURL, err := url.Parse(urlBase)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := net.SplitHostPort(dohURL.Host)
+	if err != nil {
+		host = dohURL.Host
+		port = "443"
 	}
 	nsDialer := netns.NewDialer()
 	c = &http.Client{
@@ -317,11 +338,24 @@ func (f *forwarder) getDoHClient(ip netaddr.IP) (urlBase string, c *http.Client,
 				if !strings.HasPrefix(netw, "tcp") {
 					return nil, fmt.Errorf("unexpected network %q", netw)
 				}
-				c, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), "443"))
+				toDial := host
+				if _, err := netaddr.ParseIP(toDial); err != nil && len(bootstrapRes) > 0 {
+					// Need to resolve host name, and this is
+					// the best place to do it because we
+					// were given fallback bootstrap IPs.
+					// TODO(crawshaw): time limit shorter than current ctx?
+					if ips, err := net.DefaultResolver.LookupIPAddr(ctx, toDial); err == nil && len(ips) > 0 {
+						toDial = ips[0].String()
+					} else {
+						toDial = bootstrapRes[0].String()
+					}
+				}
+				c, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(toDial, port))
 				// If v4 failed, try an equivalent v6 also in the time remaining.
 				if err != nil && ctx.Err() == nil {
+					ip := netaddr.MustParseIP(toDial)
 					if ip6, ok := dohV6(urlBase); ok && ip.Is4() {
-						if c6, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip6.String(), "443")); err == nil {
+						if c6, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip6.String(), port)); err == nil {
 							return c6, nil
 						}
 					}
@@ -330,8 +364,8 @@ func (f *forwarder) getDoHClient(ip netaddr.IP) (urlBase string, c *http.Client,
 			},
 		},
 	}
-	f.dohClient[ip] = c
-	return urlBase, c, true
+	f.dohClient[urlBase] = c
+	return c, nil
 }
 
 const dohType = "application/dns-message"
@@ -381,19 +415,32 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 //
 // send expects the reply to have the same txid as txidOut.
 //
-func (f *forwarder) send(ctx context.Context, fq *forwardQuery, dst netaddr.IPPort) ([]byte, error) {
-	ip := dst.IP()
+func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr *resolverAndDelay) ([]byte, error) {
+	if strings.HasPrefix(rr.name.Addr, "http://") || strings.HasPrefix(rr.name.Addr, "https://") {
+		dc, err := f.getDoHClient(rr.name.Addr, rr.name.BootstrapResolution)
+		if err != nil {
+			return nil, err
+		}
+		return f.sendDoH(ctx, rr.name.Addr, dc, fq.packet)
+	}
+	if strings.HasPrefix(rr.name.Addr, "tls://") {
+		return nil, fmt.Errorf("tls:// resolvers not supported yet")
+	}
+	ipp, err := netaddr.ParseIPPort(rr.name.Addr)
+	if err != nil {
+		return nil, err
+	}
 
 	// Upgrade known DNS IPs to DoH (DNS-over-HTTPs).
-	if urlBase, dc, ok := f.getDoHClient(ip); ok {
+	if urlBase, dc, ok := f.getKnownDoHClient(ipp.IP()); ok {
 		res, err := f.sendDoH(ctx, urlBase, dc, fq.packet)
 		if err == nil || ctx.Err() != nil {
 			return res, err
 		}
-		f.logf("DoH error from %v: %v", ip, err)
+		f.logf("DoH error from %v: %v", ipp.IP(), err)
 	}
 
-	ln, err := f.packetListener(ip)
+	ln, err := f.packetListener(ipp.IP())
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +454,11 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, dst netaddr.IPPo
 	fq.closeOnCtxDone.Add(conn)
 	defer fq.closeOnCtxDone.Remove(conn)
 
-	if _, err := conn.WriteTo(fq.packet, dst.UDPAddr()); err != nil {
+	udpAddr := &net.UDPAddr{
+		IP:   ipp.IP().IPAddr().IP,
+		Port: int(ipp.Port()),
+	}
+	if _, err := conn.WriteTo(fq.packet, udpAddr); err != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -525,8 +576,8 @@ func (f *forwarder) forward(query packet) error {
 		firstErr error
 	)
 
-	for _, rr := range resolvers {
-		go func(rr resolverAndDelay) {
+	for i := range resolvers {
+		go func(rr *resolverAndDelay) {
 			if rr.startDelay > 0 {
 				timer := time.NewTimer(rr.startDelay)
 				select {
@@ -536,7 +587,7 @@ func (f *forwarder) forward(query packet) error {
 					return
 				}
 			}
-			resb, err := f.send(ctx, fq, rr.ipp)
+			resb, err := f.send(ctx, fq, rr)
 			if err != nil {
 				mu.Lock()
 				defer mu.Unlock()
@@ -549,7 +600,7 @@ func (f *forwarder) forward(query packet) error {
 			case resc <- resb:
 			default:
 			}
-		}(rr)
+		}(&resolvers[i])
 	}
 
 	select {
@@ -638,7 +689,7 @@ func (p *closePool) Close() error {
 	return nil
 }
 
-var knownDoH = map[netaddr.IP]string{}
+var knownDoH = map[netaddr.IP]string{} // key is ip address as string
 
 var dohIPsOfBase = map[string][]netaddr.IP{}
 
