@@ -145,12 +145,11 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
-		Logf:           logf,
-		PacketListener: l,
+		Logf:                   logf,
+		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			epCh <- eps
 		},
-		SimulatedNetwork: l != nettype.Std{},
 	})
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
@@ -290,16 +289,12 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 			m.conn.UpdatePeers(peerSet)
 			wg, err := nmcfg.WGCfg(nm, logf, netmap.AllowSingleHosts, "")
 			if err != nil {
-				if ctx.Err() != nil {
-					// shutdown race, don't care.
-					return
-				}
 				// We're too far from the *testing.T to be graceful,
 				// blow up. Shouldn't happen anyway.
 				panic(fmt.Sprintf("failed to construct wgcfg from netmap: %v", err))
 			}
 			if err := m.Reconfig(wg); err != nil {
-				if ctx.Err() != nil {
+				if ctx.Err() != nil || errors.Is(err, errConnClosed) {
 					// shutdown race, don't care.
 					return
 				}
@@ -557,8 +552,45 @@ func makeNestable(t *testing.T) (logf logger.Logf, setT func(t *testing.T)) {
 	return logf, setT
 }
 
+// localhostOnlyListener is a nettype.PacketListener that listens on
+// localhost (127.0.0.1 or ::1, depending on the requested network)
+// when asked to listen on the unspecified address.
+//
+// It's used in tests where we set up localhost-to-localhost
+// communication, because if you listen on the unspecified address on
+// macOS and Windows, you get an interactive firewall consent prompt
+// to allow the binding, which breaks our CIs.
+type localhostListener struct{}
+
+func (localhostListener) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	switch network {
+	case "udp4":
+		switch host {
+		case "", "0.0.0.0":
+			host = "127.0.0.1"
+		case "127.0.0.1":
+		default:
+			return nil, fmt.Errorf("localhostListener cannot be asked to listen on %q", address)
+		}
+	case "udp6":
+		switch host {
+		case "", "::":
+			host = "::1"
+		case "::1":
+		default:
+			return nil, fmt.Errorf("localhostListener cannot be asked to listen on %q", address)
+		}
+	}
+	var conf net.ListenConfig
+	return conf.ListenPacket(ctx, network, net.JoinHostPort(host, port))
+}
+
 func TestTwoDevicePing(t *testing.T) {
-	l, ip := nettype.Std{}, netaddr.IPv4(127, 0, 0, 1)
+	l, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     l,
 		m1IP:   ip,
@@ -577,12 +609,12 @@ func TestNoDiscoKey(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
-	derpMap, cleanup := runDERPAndStun(t, t.Logf, nettype.Std{}, netaddr.IPv4(127, 0, 0, 1))
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
 	defer cleanup()
 
-	m1 := newMagicStack(t, t.Logf, nettype.Std{}, derpMap)
+	m1 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
 	defer m1.Close()
-	m2 := newMagicStack(t, t.Logf, nettype.Std{}, derpMap)
+	m2 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
 	defer m2.Close()
 
 	removeDisco := func(idx int, nm *netmap.NetworkMap) {
@@ -918,7 +950,6 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 					PublicKey: m2.privateKey.Public(),
 					DiscoKey:  m2.conn.DiscoPublicKey(),
 				},
-				PersistentKeepalive: 25,
 			},
 		},
 	}
@@ -934,7 +965,6 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 					PublicKey: m1.privateKey.Public(),
 					DiscoKey:  m1.conn.DiscoPublicKey(),
 				},
-				PersistentKeepalive: 25,
 			},
 		},
 	}
@@ -1051,7 +1081,7 @@ func TestDiscoMessage(t *testing.T) {
 		DiscoKey: peer1Pub,
 	}
 	c.peerMap.upsertNode(n)
-	c.peerMap.upsertDiscoEndpoint(&discoEndpoint{
+	c.peerMap.upsertDiscoEndpoint(&endpoint{
 		publicKey: n.Key,
 		discoKey:  n.DiscoKey,
 	})
@@ -1071,12 +1101,12 @@ func TestDiscoMessage(t *testing.T) {
 	}
 }
 
-// tests that having a discoEndpoint.String prevents wireguard-go's
+// tests that having a endpoint.String prevents wireguard-go's
 // log.Printf("%v") of its conn.Endpoint values from using reflect to
 // walk into read mutex while they're being used and then causing data
 // races.
 func TestDiscoStringLogRace(t *testing.T) {
-	de := new(discoEndpoint)
+	de := new(endpoint)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -1091,10 +1121,10 @@ func TestDiscoStringLogRace(t *testing.T) {
 }
 
 func Test32bitAlignment(t *testing.T) {
-	var de discoEndpoint
+	var de endpoint
 
 	if off := unsafe.Offsetof(de.lastRecv); off%8 != 0 {
-		t.Fatalf("discoEndpoint.lastRecv is not 8-byte aligned")
+		t.Fatalf("endpoint.lastRecv is not 8-byte aligned")
 	}
 
 	if !de.isFirstRecvActivityInAwhile() { // verify this doesn't panic on 32-bit
@@ -1110,8 +1140,9 @@ func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Logf: t.Logf,
-		Port: port,
+		Logf:                   t.Logf,
+		Port:                   port,
+		TestOnlyPacketListener: localhostListener{},
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			t.Logf("endpoints: %q", eps)
 		},
@@ -1350,7 +1381,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 		})
 	}
 
-	de, ok := conn.peerMap.discoEndpointForDiscoKey(discoKey)
+	de, ok := conn.peerMap.endpointForDiscoKey(discoKey)
 	if ok && de.publicKey != nodeKey2 {
 		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey[:], nodeKey2[:])
 	}
