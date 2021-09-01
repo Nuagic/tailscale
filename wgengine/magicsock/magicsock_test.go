@@ -9,7 +9,6 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -154,7 +153,6 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
 	}
-	conn.Start()
 	conn.SetDERPMap(derpMap)
 	if err := conn.SetPrivateKey(privateKey); err != nil {
 		t.Fatalf("setting private key in magicsock: %v", err)
@@ -353,7 +351,6 @@ func TestNewConn(t *testing.T) {
 	defer conn.Close()
 	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
 	conn.SetPrivateKey(wgkey.Private(key.NewPrivate()))
-	conn.Start()
 
 	go func() {
 		var pkt [64 << 10]byte
@@ -465,7 +462,6 @@ func TestDeviceStartStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn.Start()
 	defer conn.Close()
 
 	tun := tuntest.NewChannelTUN()
@@ -945,11 +941,8 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		Peers: []wgcfg.Peer{
 			wgcfg.Peer{
 				PublicKey:  m2.privateKey.Public(),
+				DiscoKey:   m2.conn.DiscoPublicKey(),
 				AllowedIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.2/32")},
-				Endpoints: wgcfg.Endpoints{
-					PublicKey: m2.privateKey.Public(),
-					DiscoKey:  m2.conn.DiscoPublicKey(),
-				},
 			},
 		},
 	}
@@ -960,11 +953,8 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		Peers: []wgcfg.Peer{
 			wgcfg.Peer{
 				PublicKey:  m1.privateKey.Public(),
+				DiscoKey:   m1.conn.DiscoPublicKey(),
 				AllowedIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.1/32")},
-				Endpoints: wgcfg.Endpoints{
-					PublicKey: m1.privateKey.Public(),
-					DiscoKey:  m1.conn.DiscoPublicKey(),
-				},
 			},
 		},
 	}
@@ -1080,7 +1070,6 @@ func TestDiscoMessage(t *testing.T) {
 		Key:      tailcfg.NodeKey(key.NewPrivate().Public()),
 		DiscoKey: peer1Pub,
 	}
-	c.peerMap.upsertNode(n)
 	c.peerMap.upsertDiscoEndpoint(&endpoint{
 		publicKey: n.Key,
 		discoKey:  n.DiscoKey,
@@ -1121,17 +1110,26 @@ func TestDiscoStringLogRace(t *testing.T) {
 }
 
 func Test32bitAlignment(t *testing.T) {
-	var de endpoint
+	// Need an associated conn with non-nil noteRecvActivity to
+	// trigger interesting work on the atomics in endpoint.
+	called := 0
+	de := endpoint{
+		c: &Conn{
+			noteRecvActivity: func(tailcfg.NodeKey) { called++ },
+		},
+	}
 
 	if off := unsafe.Offsetof(de.lastRecv); off%8 != 0 {
 		t.Fatalf("endpoint.lastRecv is not 8-byte aligned")
 	}
 
-	if !de.isFirstRecvActivityInAwhile() { // verify this doesn't panic on 32-bit
-		t.Error("expected true")
+	de.noteRecvActivity() // verify this doesn't panic on 32-bit
+	if called != 1 {
+		t.Fatal("expected call to noteRecvActivity")
 	}
-	if de.isFirstRecvActivityInAwhile() {
-		t.Error("expected false on second call")
+	de.noteRecvActivity()
+	if called != 1 {
+		t.Error("expected no second call to noteRecvActivity")
 	}
 }
 
@@ -1153,19 +1151,6 @@ func newTestConn(t testing.TB) *Conn {
 	return conn
 }
 
-func makeEndpoint(tb testing.TB, public tailcfg.NodeKey, disco tailcfg.DiscoKey) string {
-	tb.Helper()
-	ep := wgcfg.Endpoints{
-		PublicKey: wgkey.Key(public),
-		DiscoKey:  disco,
-	}
-	buf, err := json.Marshal(ep)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return string(buf)
-}
-
 // addTestEndpoint sets conn's network map to a single peer expected
 // to receive packets from sendConn (or DERP), and returns that peer's
 // nodekey and discokey.
@@ -1185,7 +1170,7 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcf
 		},
 	})
 	conn.SetPrivateKey(wgkey.Private{0: 1})
-	_, err := conn.ParseEndpoint(makeEndpoint(tb, nodeKey, discoKey))
+	_, err := conn.ParseEndpoint(wgkey.Key(nodeKey).HexString())
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -1369,7 +1354,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 			},
 		},
 	})
-	_, err := conn.ParseEndpoint(makeEndpoint(t, nodeKey1, discoKey))
+	_, err := conn.ParseEndpoint(wgkey.Key(nodeKey1).HexString())
 	if err != nil {
 		t.Fatal(err)
 	}
