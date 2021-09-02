@@ -117,6 +117,11 @@ func main() {
 		tsweb.DevMode = true
 	}
 
+	listenHost, _, err := net.SplitHostPort(*addr)
+	if err != nil {
+		log.Fatalf("invalid server address: %v", err)
+	}
+
 	var logPol *logpolicy.Policy
 	if *logCollection != "" {
 		logPol = logpolicy.New(*logCollection)
@@ -181,7 +186,7 @@ func main() {
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
 
 	if *runSTUN {
-		go serveSTUN()
+		go serveSTUN(listenHost)
 	}
 
 	httpsrv := &http.Server{
@@ -199,7 +204,6 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	var err error
 	if letsEncrypt {
 		if *certDir == "" {
 			log.Fatalf("missing required --certdir flag")
@@ -226,10 +230,14 @@ func main() {
 		}
 		go func() {
 			port80srv := &http.Server{
-				Addr:         ":80", // the default, but to be explicit
-				Handler:      certManager.HTTPHandler(tsweb.Port80Handler{Main: mux}),
-				ReadTimeout:  30 * time.Second,
-				WriteTimeout: 30 * time.Second,
+				Addr:        net.JoinHostPort(listenHost, "80"),
+				Handler:     certManager.HTTPHandler(tsweb.Port80Handler{Main: mux}),
+				ReadTimeout: 30 * time.Second,
+				// Crank up WriteTimeout a bit more than usually
+				// necessary just so we can do long CPU profiles
+				// and not hit net/http/pprof's "profile
+				// duration exceeds server's WriteTimeout".
+				WriteTimeout: 5 * time.Minute,
 			}
 			err := port80srv.ListenAndServe()
 			if err != nil {
@@ -248,8 +256,9 @@ func main() {
 	}
 }
 
-func serveSTUN() {
-	pc, err := net.ListenPacket("udp", ":3478")
+func serveSTUN(host string) {
+
+	pc, err := net.ListenPacket("udp", net.JoinHostPort(host, "3478"))
 	if err != nil {
 		log.Fatalf("failed to open STUN listener: %v", err)
 	}
