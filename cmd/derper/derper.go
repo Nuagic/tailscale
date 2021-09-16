@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/acme/autocert"
 	"tailscale.com/atomicfile"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
@@ -39,6 +38,7 @@ var (
 	dev           = flag.Bool("dev", false, "run in localhost development mode")
 	addr          = flag.String("a", ":443", "server address")
 	configPath    = flag.String("c", "", "config file path")
+	certMode      = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt")
 	certDir       = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
 	hostname      = flag.String("hostname", "derp.tailscale.com", "LetsEncrypt host name, if addr's port is :443")
 	logCollection = flag.String("logcollection", "", "If non-empty, logtail collection to log to")
@@ -48,6 +48,26 @@ var (
 	bootstrapDNS  = flag.String("bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns")
 	verifyClients = flag.Bool("verify-clients", false, "verify clients to this DERP server through a local tailscaled instance.")
 )
+
+var (
+	stats           = new(metrics.Set)
+	stunDisposition = &metrics.LabelMap{Label: "disposition"}
+	stunAddrFamily  = &metrics.LabelMap{Label: "family"}
+
+	stunReadError  = stunDisposition.Get("read_error")
+	stunNotSTUN    = stunDisposition.Get("not_stun")
+	stunWriteError = stunDisposition.Get("write_error")
+	stunSuccess    = stunDisposition.Get("success")
+
+	stunIPv4 = stunAddrFamily.Get("ipv4")
+	stunIPv6 = stunAddrFamily.Get("ipv6")
+)
+
+func init() {
+	stats.Set("counter_requests", stunDisposition)
+	stats.Set("counter_addrfamily", stunAddrFamily)
+	expvar.Publish("stun", stats)
+}
 
 type config struct {
 	PrivateKey wgkey.Private
@@ -130,7 +150,7 @@ func main() {
 
 	cfg := loadConfig()
 
-	letsEncrypt := tsweb.IsProd443(*addr)
+	serveTLS := tsweb.IsProd443(*addr)
 
 	s := derp.NewServer(key.Private(cfg.PrivateKey), log.Printf)
 	s.SetVerifyClient(*verifyClients)
@@ -204,24 +224,17 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	if letsEncrypt {
-		if *certDir == "" {
-			log.Fatalf("missing required --certdir flag")
-		}
+	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
-		certManager := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(*hostname),
-			Cache:      autocert.DirCache(*certDir),
-		}
-		if *hostname == "derp.tailscale.com" {
-			certManager.HostPolicy = prodAutocertHostPolicy
-			certManager.Email = "security@tailscale.com"
+		var certManager certProvider
+		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname)
+		if err != nil {
+			log.Fatalf("derper: can not start cert provider: %v", err)
 		}
 		httpsrv.TLSConfig = certManager.TLSConfig()
-		letsEncryptGetCert := httpsrv.TLSConfig.GetCertificate
+		getCert := httpsrv.TLSConfig.GetCertificate
 		httpsrv.TLSConfig.GetCertificate = func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			cert, err := letsEncryptGetCert(hi)
+			cert, err := getCert(hi)
 			if err != nil {
 				return nil, err
 			}
@@ -263,36 +276,24 @@ func serveSTUN(host string) {
 		log.Fatalf("failed to open STUN listener: %v", err)
 	}
 	log.Printf("running STUN server on %v", pc.LocalAddr())
+	serverSTUNListener(context.Background(), pc.(*net.UDPConn))
+}
 
-	var (
-		stats           = new(metrics.Set)
-		stunDisposition = &metrics.LabelMap{Label: "disposition"}
-		stunAddrFamily  = &metrics.LabelMap{Label: "family"}
-
-		stunReadError  = stunDisposition.Get("read_error")
-		stunNotSTUN    = stunDisposition.Get("not_stun")
-		stunWriteError = stunDisposition.Get("write_error")
-		stunSuccess    = stunDisposition.Get("success")
-
-		stunIPv4 = stunAddrFamily.Get("ipv4")
-		stunIPv6 = stunAddrFamily.Get("ipv6")
-	)
-	stats.Set("counter_requests", stunDisposition)
-	stats.Set("counter_addrfamily", stunAddrFamily)
-	expvar.Publish("stun", stats)
-
+func serverSTUNListener(ctx context.Context, pc *net.UDPConn) {
 	var buf [64 << 10]byte
+	var (
+		n   int
+		ua  *net.UDPAddr
+		err error
+	)
 	for {
-		n, addr, err := pc.ReadFrom(buf[:])
+		n, ua, err = pc.ReadFromUDP(buf[:])
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("STUN ReadFrom: %v", err)
 			time.Sleep(time.Second)
-			stunReadError.Add(1)
-			continue
-		}
-		ua, ok := addr.(*net.UDPAddr)
-		if !ok {
-			log.Printf("STUN unexpected address %T %v", addr, addr)
 			stunReadError.Add(1)
 			continue
 		}
@@ -312,7 +313,7 @@ func serveSTUN(host string) {
 			stunIPv6.Add(1)
 		}
 		res := stun.Response(txid, ua.IP, uint16(ua.Port))
-		_, err = pc.WriteTo(res, addr)
+		_, err = pc.WriteTo(res, ua)
 		if err != nil {
 			stunWriteError.Add(1)
 		} else {

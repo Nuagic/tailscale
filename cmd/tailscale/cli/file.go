@@ -23,7 +23,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
@@ -91,7 +91,7 @@ func runCp(ctx context.Context, args []string) error {
 	} else if hadBrackets && (err != nil || !ip.Is6()) {
 		return errors.New("unexpected brackets around target")
 	}
-	ip, err := tailscaleIPFromArg(ctx, target)
+	ip, _, err := tailscaleIPFromArg(ctx, target)
 	if err != nil {
 		return err
 	}

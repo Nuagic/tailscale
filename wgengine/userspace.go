@@ -37,6 +37,7 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -330,6 +331,8 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 	closePool.add(e.magicConn)
 	e.magicConn.SetNetworkUp(e.linkMon.InterfaceState().AnyInterfaceUp())
+
+	tsTUNDev.SetDiscoKey(e.magicConn.DiscoPublicKey())
 
 	if conf.RespondToPing {
 		e.tundev.PostFilterIn = echoRespondToAll
@@ -1244,7 +1247,7 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 
 func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.PingResult)) {
 	res := &ipnstate.PingResult{IP: ip.String()}
-	peer, err := e.peerForIP(ip)
+	peer, self, err := e.peerForIP(ip)
 	if err != nil {
 		e.logf("ping(%v): %v", ip, err)
 		res.Err = err.Error()
@@ -1257,6 +1260,13 @@ func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.Pi
 		cb(res)
 		return
 	}
+	if self {
+		res.Err = fmt.Sprintf("%v is local Tailscale IP", ip)
+		res.IsLocalIP = true
+		cb(res)
+		return
+	}
+
 	pingType := "disco"
 	if useTSMP {
 		pingType = "TSMP"
@@ -1400,12 +1410,12 @@ func (e *userspaceEngine) WhoIsIPPort(ipport netaddr.IPPort) (tsIP netaddr.IP, o
 //
 // peerForIP acquires both e.mu and e.wgLock, but neither at the same
 // time.
-func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, err error) {
+func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, isSelf bool, err error) {
 	e.mu.Lock()
 	nm := e.netMap
 	e.mu.Unlock()
 	if nm == nil {
-		return nil, errors.New("no network map")
+		return nil, false, errors.New("no network map")
 	}
 
 	// Check for exact matches before looking for subnet matches.
@@ -1414,7 +1424,7 @@ func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, err error) 
 	for _, p := range nm.Peers {
 		for _, a := range p.Addresses {
 			if a.IP() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
-				return p, nil
+				return p, false, nil
 			}
 		}
 		for _, cidr := range p.AllowedIPs {
@@ -1425,6 +1435,11 @@ func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, err error) 
 				bestInNMPrefix = cidr
 				bestInNM = p
 			}
+		}
+	}
+	for _, a := range nm.Addresses {
+		if a.IP() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
+			return nm.SelfNode, true, nil
 		}
 	}
 
@@ -1450,17 +1465,17 @@ func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, err error) 
 	if !bestKey.IsZero() {
 		for _, p := range nm.Peers {
 			if p.Key == bestKey {
-				return p, nil
+				return p, false, nil
 			}
 		}
 	}
 	if bestInNM == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if bestInNMPrefix.Bits() == 0 {
-		return nil, errors.New("exit node found but not enabled")
+		return nil, false, errors.New("exit node found but not enabled")
 	}
-	return nil, fmt.Errorf("node %q found, but not using its %v route", bestInNM.ComputedNameWithHost, bestInNMPrefix)
+	return nil, false, fmt.Errorf("node %q found, but not using its %v route", bestInNM.ComputedNameWithHost, bestInNMPrefix)
 }
 
 type closeOnErrorPool []func()
@@ -1491,9 +1506,16 @@ func ipInPrefixes(ip netaddr.IP, pp []netaddr.IPPrefix) bool {
 func dnsIPsOverTailscale(dnsCfg *dns.Config, routerCfg *router.Config) (ret []netaddr.IPPrefix) {
 	m := map[netaddr.IP]bool{}
 
-	add := func(resolvers []netaddr.IPPort) {
-		for _, resolver := range resolvers {
-			ip := resolver.IP()
+	add := func(resolvers []dnstype.Resolver) {
+		for _, r := range resolvers {
+			ip, err := netaddr.ParseIP(r.Addr)
+			if err != nil {
+				if ipp, err := netaddr.ParseIPPort(r.Addr); err == nil {
+					ip = ipp.IP()
+				} else {
+					continue
+				}
+			}
 			if ipInPrefixes(ip, routerCfg.Routes) && !ipInPrefixes(ip, routerCfg.LocalRoutes) {
 				m[ip] = true
 			}

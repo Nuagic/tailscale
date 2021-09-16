@@ -601,18 +601,12 @@ func (b *LocalBackend) findExitNodeIDLocked(nm *netmap.NetworkMap) (prefsChanged
 func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	if err != nil {
 		b.logf("wgengine status error: %v", err)
-
-		b.statusLock.Lock()
 		b.statusChanged.Broadcast()
-		b.statusLock.Unlock()
 		return
 	}
 	if s == nil {
 		b.logf("[unexpected] non-error wgengine update with status=nil: %v", s)
-
-		b.statusLock.Lock()
 		b.statusChanged.Broadcast()
-		b.statusLock.Unlock()
 		return
 	}
 
@@ -620,19 +614,32 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	es := b.parseWgStatusLocked(s)
 	cc := b.cc
 	b.engineStatus = es
-	b.endpoints = append([]tailcfg.Endpoint{}, s.LocalAddrs...)
+	needUpdateEndpoints := !endpointsEqual(s.LocalAddrs, b.endpoints)
+	if needUpdateEndpoints {
+		b.endpoints = append([]tailcfg.Endpoint{}, s.LocalAddrs...)
+	}
 	b.mu.Unlock()
 
 	if cc != nil {
-		cc.UpdateEndpoints(0, s.LocalAddrs)
+		if needUpdateEndpoints {
+			cc.UpdateEndpoints(0, s.LocalAddrs)
+		}
 		b.stateMachine()
 	}
-
-	b.statusLock.Lock()
 	b.statusChanged.Broadcast()
-	b.statusLock.Unlock()
-
 	b.send(ipn.Notify{Engine: &es})
+}
+
+func endpointsEqual(x, y []tailcfg.Endpoint) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *LocalBackend) SetNotifyCallback(notify func(ipn.Notify)) {
@@ -1420,16 +1427,6 @@ func (b *LocalBackend) InServerMode() bool {
 	return b.inServerMode
 }
 
-// getEngineStatus returns a copy of b.engineStatus.
-//
-// TODO(bradfitz): remove this and use Status() throughout.
-func (b *LocalBackend) getEngineStatus() ipn.EngineStatus {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b.engineStatus
-}
-
 // Login implements Backend.
 func (b *LocalBackend) Login(token *tailcfg.Oauth2Token) {
 	b.mu.Lock()
@@ -1728,7 +1725,7 @@ func (b *LocalBackend) blockEngineUpdates(block bool) {
 func (b *LocalBackend) authReconfig() {
 	b.mu.Lock()
 	blocked := b.blocked
-	uc := b.prefs
+	prefs := b.prefs
 	nm := b.netMap
 	hasPAC := b.prevIfState.HasPAC()
 	disableSubnetsIfPAC := nm != nil && nm.Debug != nil && nm.Debug.DisableSubnetsIfPAC.EqualBool(true)
@@ -1742,16 +1739,16 @@ func (b *LocalBackend) authReconfig() {
 		b.logf("authReconfig: netmap not yet valid. Skipping.")
 		return
 	}
-	if !uc.WantRunning {
+	if !prefs.WantRunning {
 		b.logf("authReconfig: skipping because !WantRunning.")
 		return
 	}
 
 	var flags netmap.WGConfigFlags
-	if uc.RouteAll {
+	if prefs.RouteAll {
 		flags |= netmap.AllowSubnetRoutes
 	}
-	if uc.AllowSingleHosts {
+	if prefs.AllowSingleHosts {
 		flags |= netmap.AllowSingleHosts
 	}
 	if hasPAC && disableSubnetsIfPAC {
@@ -1761,16 +1758,32 @@ func (b *LocalBackend) authReconfig() {
 		}
 	}
 
-	cfg, err := nmcfg.WGCfg(nm, b.logf, flags, uc.ExitNodeID)
+	cfg, err := nmcfg.WGCfg(nm, b.logf, flags, prefs.ExitNodeID)
 	if err != nil {
 		b.logf("wgcfg: %v", err)
 		return
 	}
 
-	rcfg := b.routerConfig(cfg, uc)
+	rcfg := b.routerConfig(cfg, prefs)
+	dcfg := dnsConfigForNetmap(nm, prefs, b.logf, version.OS())
 
-	dcfg := dns.Config{
-		Routes: map[dnsname.FQDN][]netaddr.IPPort{},
+	err = b.e.Reconfig(cfg, rcfg, dcfg, nm.Debug)
+	if err == wgengine.ErrNoChanges {
+		return
+	}
+	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll, prefs.CorpDNS, flags, err)
+
+	b.initPeerAPIListener()
+}
+
+// dnsConfigForNetmap returns a *dns.Config for the given netmap,
+// prefs, and client OS version.
+//
+// The versionOS is a Tailscale-style version ("iOS", "macOS") and not
+// a runtime.GOOS.
+func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs *ipn.Prefs, logf logger.Logf, versionOS string) *dns.Config {
+	dcfg := &dns.Config{
+		Routes: map[dnsname.FQDN][]dnstype.Resolver{},
 		Hosts:  map[dnsname.FQDN][]netaddr.IP{},
 	}
 
@@ -1787,6 +1800,7 @@ func (b *LocalBackend) authReconfig() {
 		if err != nil {
 			return // TODO: propagate error?
 		}
+		have4 := tsaddr.PrefixesContainsFunc(addrs, func(p netaddr.IPPrefix) bool { return p.IP().Is4() })
 		var ips []netaddr.IP
 		for _, addr := range addrs {
 			// Remove IPv6 addresses for now, as we don't
@@ -1796,7 +1810,7 @@ func (b *LocalBackend) authReconfig() {
 			// https://github.com/tailscale/tailscale/issues/1152
 			// tracks adding the right capability reporting to
 			// enable AAAA in MagicDNS.
-			if addr.IP().Is6() {
+			if addr.IP().Is6() && have4 {
 				continue
 			}
 			ips = append(ips, addr.IP())
@@ -1827,100 +1841,88 @@ func (b *LocalBackend) authReconfig() {
 		dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
 	}
 
-	if uc.CorpDNS {
-		addDefault := func(resolvers []dnstype.Resolver) {
-			for _, resolver := range resolvers {
-				res, err := parseResolver(resolver)
-				if err != nil {
-					b.logf("skipping bad resolver: %v", err.Error())
-					continue
-				}
-				dcfg.DefaultResolvers = append(dcfg.DefaultResolvers, res)
-			}
-		}
+	if !prefs.CorpDNS {
+		return dcfg
+	}
 
-		addDefault(nm.DNS.Resolvers)
-		for suffix, resolvers := range nm.DNS.Routes {
-			fqdn, err := dnsname.ToFQDN(suffix)
-			if err != nil {
-				b.logf("[unexpected] non-FQDN route suffix %q", suffix)
-			}
-
-			// Create map entry even if len(resolvers) == 0; Issue 2706.
-			// This lets the control plane send ExtraRecords for which we
-			// can authoritatively answer "name not exists" for when the
-			// control plane also sends this explicit but empty route
-			// making it as something we handle.
-			//
-			// While we're already populating it, might as well size the
-			// slice appropriately.
-			dcfg.Routes[fqdn] = make([]netaddr.IPPort, 0, len(resolvers))
-
-			for _, resolver := range resolvers {
-				res, err := parseResolver(resolver)
-				if err != nil {
-					b.logf(err.Error())
-					continue
-				}
-				dcfg.Routes[fqdn] = append(dcfg.Routes[fqdn], res)
-			}
-		}
-		for _, dom := range nm.DNS.Domains {
-			fqdn, err := dnsname.ToFQDN(dom)
-			if err != nil {
-				b.logf("[unexpected] non-FQDN search domain %q", dom)
-			}
-			dcfg.SearchDomains = append(dcfg.SearchDomains, fqdn)
-		}
-		if nm.DNS.Proxied { // actually means "enable MagicDNS"
-			for _, dom := range magicDNSRootDomains(nm) {
-				dcfg.Routes[dom] = nil // resolve internally with dcfg.Hosts
-			}
-		}
-
-		// Set FallbackResolvers as the default resolvers in the
-		// scenarios that can't handle a purely split-DNS config. See
-		// https://github.com/tailscale/tailscale/issues/1743 for
-		// details.
-		switch {
-		case len(dcfg.DefaultResolvers) != 0:
-			// Default resolvers already set.
-		case !uc.ExitNodeID.IsZero():
-			// When using exit nodes, it's very likely the LAN
-			// resolvers will become unreachable. So, force use of the
-			// fallback resolvers until we implement DNS forwarding to
-			// exit nodes.
-			//
-			// This is especially important on Apple OSes, where
-			// adding the default route to the tunnel interface makes
-			// it "primary", and we MUST provide VPN-sourced DNS
-			// settings or we break all DNS resolution.
-			//
-			// https://github.com/tailscale/tailscale/issues/1713
-			addDefault(nm.DNS.FallbackResolvers)
-		case len(dcfg.Routes) == 0:
-			// No settings requiring split DNS, no problem.
-		case version.OS() == "android":
-			// We don't support split DNS at all on Android yet.
-			addDefault(nm.DNS.FallbackResolvers)
+	addDefault := func(resolvers []dnstype.Resolver) {
+		for _, r := range resolvers {
+			dcfg.DefaultResolvers = append(dcfg.DefaultResolvers, normalizeResolver(r))
 		}
 	}
 
-	err = b.e.Reconfig(cfg, rcfg, &dcfg, nm.Debug)
-	if err == wgengine.ErrNoChanges {
-		return
-	}
-	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", uc.RouteAll, uc.CorpDNS, flags, err)
+	addDefault(nm.DNS.Resolvers)
+	for suffix, resolvers := range nm.DNS.Routes {
+		fqdn, err := dnsname.ToFQDN(suffix)
+		if err != nil {
+			logf("[unexpected] non-FQDN route suffix %q", suffix)
+		}
 
-	b.initPeerAPIListener()
+		// Create map entry even if len(resolvers) == 0; Issue 2706.
+		// This lets the control plane send ExtraRecords for which we
+		// can authoritatively answer "name not exists" for when the
+		// control plane also sends this explicit but empty route
+		// making it as something we handle.
+		//
+		// While we're already populating it, might as well size the
+		// slice appropriately.
+		dcfg.Routes[fqdn] = make([]dnstype.Resolver, 0, len(resolvers))
+
+		for _, r := range resolvers {
+			dcfg.Routes[fqdn] = append(dcfg.Routes[fqdn], normalizeResolver(r))
+		}
+	}
+	for _, dom := range nm.DNS.Domains {
+		fqdn, err := dnsname.ToFQDN(dom)
+		if err != nil {
+			logf("[unexpected] non-FQDN search domain %q", dom)
+		}
+		dcfg.SearchDomains = append(dcfg.SearchDomains, fqdn)
+	}
+	if nm.DNS.Proxied { // actually means "enable MagicDNS"
+		for _, dom := range magicDNSRootDomains(nm) {
+			dcfg.Routes[dom] = nil // resolve internally with dcfg.Hosts
+		}
+	}
+
+	// Set FallbackResolvers as the default resolvers in the
+	// scenarios that can't handle a purely split-DNS config. See
+	// https://github.com/tailscale/tailscale/issues/1743 for
+	// details.
+	switch {
+	case len(dcfg.DefaultResolvers) != 0:
+		// Default resolvers already set.
+	case !prefs.ExitNodeID.IsZero():
+		// When using exit nodes, it's very likely the LAN
+		// resolvers will become unreachable. So, force use of the
+		// fallback resolvers until we implement DNS forwarding to
+		// exit nodes.
+		//
+		// This is especially important on Apple OSes, where
+		// adding the default route to the tunnel interface makes
+		// it "primary", and we MUST provide VPN-sourced DNS
+		// settings or we break all DNS resolution.
+		//
+		// https://github.com/tailscale/tailscale/issues/1713
+		addDefault(nm.DNS.FallbackResolvers)
+	case len(dcfg.Routes) == 0:
+		// No settings requiring split DNS, no problem.
+	case versionOS == "android":
+		// We don't support split DNS at all on Android yet.
+		addDefault(nm.DNS.FallbackResolvers)
+	}
+
+	return dcfg
 }
 
-func parseResolver(cfg dnstype.Resolver) (netaddr.IPPort, error) {
-	ip, err := netaddr.ParseIP(cfg.Addr)
-	if err != nil {
-		return netaddr.IPPort{}, fmt.Errorf("[unexpected] non-IP resolver %q", cfg.Addr)
+func normalizeResolver(cfg dnstype.Resolver) dnstype.Resolver {
+	if ip, err := netaddr.ParseIP(cfg.Addr); err == nil {
+		// Add 53 here for bare IPs for consistency with previous data type.
+		return dnstype.Resolver{
+			Addr: netaddr.IPPortFrom(ip, 53).String(),
+		}
 	}
-	return netaddr.IPPortFrom(ip, 53), nil
+	return cfg
 }
 
 // tailscaleVarRoot returns the root directory of Tailscale's writable
@@ -2324,6 +2326,7 @@ func (b *LocalBackend) nextState() ipn.State {
 		blocked     = b.blocked
 		wantRunning = b.prefs.WantRunning
 		loggedOut   = b.prefs.LoggedOut
+		st          = b.engineStatus
 	)
 	b.mu.Unlock()
 
@@ -2335,22 +2338,22 @@ func (b *LocalBackend) nextState() ipn.State {
 			// Auth was interrupted or waiting for URL visit,
 			// so it won't proceed without human help.
 			return ipn.NeedsLogin
-		} else if state == ipn.Stopped {
+		}
+		switch state {
+		case ipn.Stopped:
 			// If we were already in the Stopped state, then
 			// we can assume auth is in good shape (or we would
 			// have been in NeedsLogin), so transition to Starting
 			// right away.
 			return ipn.Starting
-		} else if state == ipn.NoState {
+		case ipn.NoState:
 			// Our first time connecting to control, and we
 			// don't know if we'll NeedsLogin or not yet.
 			// UIs should print "Loading..." in this state.
 			return ipn.NoState
-		} else if state == ipn.Starting ||
-			state == ipn.Running ||
-			state == ipn.NeedsLogin {
+		case ipn.Starting, ipn.Running, ipn.NeedsLogin:
 			return state
-		} else {
+		default:
 			b.logf("unexpected no-netmap state transition for %v", state)
 			return state
 		}
@@ -2365,7 +2368,7 @@ func (b *LocalBackend) nextState() ipn.State {
 		// (if we get here, we know MachineAuthorized == true)
 		return ipn.Starting
 	case state == ipn.Starting:
-		if st := b.getEngineStatus(); st.NumLive > 0 || st.LiveDERPs > 0 {
+		if st.NumLive > 0 || st.LiveDERPs > 0 {
 			return ipn.Running
 		} else {
 			return state

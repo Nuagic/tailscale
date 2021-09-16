@@ -19,12 +19,24 @@ import (
 	"net"
 
 	"inet.af/netaddr"
+	"tailscale.com/syncs"
 )
+
+var disabled syncs.AtomicBool
+
+// SetEnabled enables or disables netns for the process.
+// It defaults to being enabled.
+func SetEnabled(on bool) {
+	disabled.Set(!on)
+}
 
 // Listener returns a new net.Listener with its Control hook func
 // initialized as necessary to run in logical network namespace that
 // doesn't route back into Tailscale.
 func Listener() *net.ListenConfig {
+	if disabled.Get() {
+		return new(net.ListenConfig)
+	}
 	return &net.ListenConfig{Control: control}
 }
 
@@ -41,6 +53,9 @@ func NewDialer() Dialer {
 // handles using a SOCKS if configured in the environment with
 // ALL_PROXY.
 func FromDialer(d *net.Dialer) Dialer {
+	if disabled.Get() {
+		return d
+	}
 	d.Control = control
 	if wrapDialer != nil {
 		return wrapDialer(d)

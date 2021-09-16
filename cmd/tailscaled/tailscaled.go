@@ -32,6 +32,7 @@ import (
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/netns"
 	"tailscale.com/net/socks5/tssocks"
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
@@ -387,6 +388,10 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, name string) (e wgengine.
 		ListenPort:  args.port,
 		LinkMonitor: linkMon,
 	}
+
+	useNetstack = name == "userspace-networking"
+	netns.SetEnabled(!useNetstack)
+
 	if args.birdSocketPath != "" && createBIRDClient != nil {
 		log.Printf("Connecting to BIRD at %s ...", args.birdSocketPath)
 		conf.BIRDClient, err = createBIRDClient(args.birdSocketPath)
@@ -394,7 +399,6 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, name string) (e wgengine.
 			return nil, false, err
 		}
 	}
-	useNetstack = name == "userspace-networking"
 	if !useNetstack {
 		dev, devName, err := tstun.New(logf, name)
 		if err != nil {
