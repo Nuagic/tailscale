@@ -601,12 +601,12 @@ func (b *LocalBackend) findExitNodeIDLocked(nm *netmap.NetworkMap) (prefsChanged
 func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	if err != nil {
 		b.logf("wgengine status error: %v", err)
-		b.statusChanged.Broadcast()
+		b.broadcastStatusChanged()
 		return
 	}
 	if s == nil {
 		b.logf("[unexpected] non-error wgengine update with status=nil: %v", s)
-		b.statusChanged.Broadcast()
+		b.broadcastStatusChanged()
 		return
 	}
 
@@ -626,8 +626,18 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 		}
 		b.stateMachine()
 	}
-	b.statusChanged.Broadcast()
+	b.broadcastStatusChanged()
 	b.send(ipn.Notify{Engine: &es})
+}
+
+func (b *LocalBackend) broadcastStatusChanged() {
+	// The sync.Cond docs say: "It is allowed but not required for the caller to hold c.L during the call."
+	// In this particular case, we must acquire b.statusLock. Otherwise we might broadcast before
+	// the waiter (in requestEngineStatusAndWait) starts to wait, in which case
+	// the waiter can get stuck indefinitely. See PR 2865.
+	b.statusLock.Lock()
+	b.statusChanged.Broadcast()
+	b.statusLock.Unlock()
 }
 
 func endpointsEqual(x, y []tailcfg.Endpoint) bool {
