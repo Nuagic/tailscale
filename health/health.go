@@ -9,6 +9,7 @@ package health
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,7 @@ var (
 	ipnWantRunning          bool
 	anyInterfaceUp          = true // until told otherwise
 	udp4Unbound             bool
+	controlHealth           []string
 )
 
 // Subsystem is the name of a subsystem whose health can be monitored.
@@ -138,6 +140,13 @@ func setLocked(key Subsystem, err error) {
 	for _, cb := range watchers {
 		go cb(key, err)
 	}
+}
+
+func SetControlHealth(problems []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	controlHealth = problems
+	selfCheckLocked()
 }
 
 // GotStreamedMapResponse notes that we got a tailcfg.MapResponse
@@ -265,6 +274,8 @@ func OverallError() error {
 	return overallErrorLocked()
 }
 
+var fakeErrForTesting = os.Getenv("TS_DEBUG_FAKE_HEALTH_ERROR")
+
 func overallErrorLocked() error {
 	if !anyInterfaceUp {
 		return errors.New("network down")
@@ -314,6 +325,12 @@ func overallErrorLocked() error {
 	}
 	for regionID, problem := range derpRegionHealthProblem {
 		errs = append(errs, fmt.Errorf("derp%d: %v", regionID, problem))
+	}
+	for _, s := range controlHealth {
+		errs = append(errs, errors.New(s))
+	}
+	if e := fakeErrForTesting; len(errs) == 0 && e != "" {
+		return errors.New(e)
 	}
 	sort.Slice(errs, func(i, j int) bool {
 		// Not super efficient (stringifying these in a sort), but probably max 2 or 3 items.

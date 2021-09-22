@@ -47,7 +47,8 @@ import (
 //    21: 2021-06-15: added MapResponse.DNSConfig.CertDomains
 //    22: 2021-06-16: added MapResponse.DNSConfig.ExtraRecords
 //    23: 2021-08-25: DNSConfig.Routes values may be empty (for ExtraRecords support in 1.14.1+)
-const CurrentMapRequestVersion = 23
+//    24: 2021-09-18: MapResponse.Health from control to node; node shows in "tailscale status"
+const CurrentMapRequestVersion = 24
 
 type StableID string
 
@@ -558,10 +559,16 @@ const (
 	// be considered an error if seen.
 	SignatureUnknown
 	// SignatureV1 is computed as RSA-PSS-Sign(privateKeyForDeviceCert,
+	// SHA256(Timestamp || ServerIdentity || DeviceCert || ServerShortPubKey ||
+	// MachineShortPubKey)). The PSS salt length is equal to hash length
+	// (rsa.PSSSaltLengthEqualsHash). Device cert is required.
+	// Deprecated: uses old key serialization format.
+	SignatureV1
+	// SignatureV2 is computed as RSA-PSS-Sign(privateKeyForDeviceCert,
 	// SHA256(Timestamp || ServerIdentity || DeviceCert || ServerPubKey ||
 	// MachinePubKey)). The PSS salt length is equal to hash length
 	// (rsa.PSSSaltLengthEqualsHash). Device cert is required.
-	SignatureV1
+	SignatureV2
 )
 
 func (st SignatureType) MarshalText() ([]byte, error) {
@@ -574,6 +581,8 @@ func (st *SignatureType) UnmarshalText(b []byte) error {
 		*st = SignatureNone
 	case "signature-v1":
 		*st = SignatureV1
+	case "signature-v2":
+		*st = SignatureV2
 	default:
 		var val int
 		if _, err := fmt.Sscanf(string(b), "signature-unknown(%d)", &val); err != nil {
@@ -593,6 +602,8 @@ func (st SignatureType) String() string {
 		return "signature-unknown"
 	case SignatureV1:
 		return "signature-v1"
+	case SignatureV2:
+		return "signature-v2"
 	default:
 		return fmt.Sprintf("signature-unknown(%d)", int(st))
 	}
@@ -1017,6 +1028,14 @@ type MapResponse struct {
 	// As as of 1.1.541 (mapver 5), this contains new or updated
 	// user profiles only.
 	UserProfiles []UserProfile `json:",omitempty"`
+
+	// Health, if non-nil, sets the health state
+	// of the node from the control plane's perspective.
+	// A nil value means no change from the previous MapResponse.
+	// A non-nil 0-length slice restores the health to good (no known problems).
+	// A non-zero length slice are the list of problems that the control place
+	// sees.
+	Health []string `json:",omitempty"`
 
 	// Debug is normally nil, except for when the control server
 	// is setting debug settings on a node.
