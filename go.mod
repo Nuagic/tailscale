@@ -7,13 +7,13 @@ require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/aws/aws-sdk-go v1.38.52
 	github.com/coreos/go-iptables v0.6.0
-	github.com/creack/pty v1.1.9
+	github.com/creack/pty v1.1.15
 	github.com/dave/jennifer v1.4.1
 	github.com/frankban/quicktest v1.13.0
-	github.com/gliderlabs/ssh v0.3.2
+	github.com/gliderlabs/ssh v0.3.3
 	github.com/go-multierror/multierror v1.0.2
 	github.com/go-ole/go-ole v1.2.5
-	github.com/godbus/dbus/v5 v5.0.4
+	github.com/godbus/dbus/v5 v5.0.5
 	github.com/google/go-cmp v0.5.6
 	github.com/google/uuid v1.1.2
 	github.com/goreleaser/nfpm v1.10.3
@@ -21,14 +21,14 @@ require (
 	github.com/insomniacslk/dhcp v0.0.0-20210621130208-1cac67f12b1e
 	github.com/jsimonetti/rtnetlink v0.0.0-20210525051524-4cc836578190
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/klauspost/compress v1.12.2
+	github.com/klauspost/compress v1.13.6
 	github.com/mdlayher/netlink v1.4.1
 	github.com/mdlayher/sdnotify v0.0.0-20210228150836-ea3ec207d697
-	github.com/miekg/dns v1.1.42
+	github.com/miekg/dns v1.1.43
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/pborman/getopt v1.1.0
 	github.com/peterbourgon/ff/v3 v3.1.0
-	github.com/pkg/sftp v1.13.0
+	github.com/pkg/sftp v1.13.3
 	github.com/tailscale/certstore v0.0.0-20210528134328-066c94b793d3
 	github.com/tailscale/depaware v0.0.0-20201214215404-77d1e9757027
 	github.com/tailscale/goexpect v0.0.0-20210902213824-6e8c725cea41
@@ -87,7 +87,6 @@ require (
 	github.com/go-xmlfmt/xmlfmt v0.0.0-20191208150333-d5b6f63a941b // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/gofrs/flock v0.8.0 // indirect
-	github.com/golang/snappy v0.0.3 // indirect
 	github.com/golangci/check v0.0.0-20180506172741-cfe4005ccda2 // indirect
 	github.com/golangci/dupl v0.0.0-20180902072040-3e9179ac440a // indirect
 	github.com/golangci/errcheck v0.0.0-20181223084120-ef45e06d44b6 // indirect
@@ -167,7 +166,7 @@ require (
 	github.com/spf13/viper v1.7.1 // indirect
 	github.com/ssgreg/nlreturn/v2 v2.1.0 // indirect
 	github.com/stretchr/objx v0.3.0 // indirect
-	github.com/stretchr/testify v1.6.1 // indirect
+	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/subosito/gotenv v1.2.0 // indirect
 	github.com/tdakkota/asciicheck v0.0.0-20200416200610-e657995f937b // indirect
 	github.com/tetafro/godot v1.3.2 // indirect
