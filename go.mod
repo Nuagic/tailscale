@@ -7,15 +7,15 @@ require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/aws/aws-sdk-go v1.38.52
 	github.com/coreos/go-iptables v0.6.0
-	github.com/creack/pty v1.1.15
+	github.com/creack/pty v1.1.16
 	github.com/dave/jennifer v1.4.1
-	github.com/frankban/quicktest v1.13.0
+	github.com/frankban/quicktest v1.13.1
 	github.com/gliderlabs/ssh v0.3.3
 	github.com/go-multierror/multierror v1.0.2
 	github.com/go-ole/go-ole v1.2.5
 	github.com/godbus/dbus/v5 v5.0.5
 	github.com/google/go-cmp v0.5.6
-	github.com/google/uuid v1.1.2
+	github.com/google/uuid v1.3.0
 	github.com/goreleaser/nfpm v1.10.3
 	github.com/iancoleman/strcase v0.2.0
 	github.com/insomniacslk/dhcp v0.0.0-20210621130208-1cac67f12b1e
@@ -28,7 +28,7 @@ require (
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/pborman/getopt v1.1.0
 	github.com/peterbourgon/ff/v3 v3.1.0
-	github.com/pkg/sftp v1.13.3
+	github.com/pkg/sftp v1.13.4
 	github.com/tailscale/certstore v0.0.0-20210528134328-066c94b793d3
 	github.com/tailscale/depaware v0.0.0-20201214215404-77d1e9757027
 	github.com/tailscale/goexpect v0.0.0-20210902213824-6e8c725cea41
@@ -38,15 +38,15 @@ require (
 	github.com/toqueteos/webbrowser v1.2.0
 	github.com/ulikunitz/xz v0.5.10 // indirect
 	go4.org/mem v0.0.0-20201119185036-c04c5a6ff174
-	golang.org/x/crypto v0.0.0-20210616213533-5ff15b29337e
-	golang.org/x/net v0.0.0-20210614182718-04defd469f4e
+	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5
+	golang.org/x/net v0.0.0-20210903162142-ad29c8ab022f
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210817190340-bfb29a6856f2
+	golang.org/x/sys v0.0.0-20210906170528-6f6e22806c34
 	golang.org/x/term v0.0.0-20210503060354-a79de5458b56
 	golang.org/x/time v0.0.0-20210611083556-38a9dc6acbc6
-	golang.org/x/tools v0.1.2
-	golang.zx2c4.com/wireguard v0.0.0-20210624150102-15b24b6179e0
-	golang.zx2c4.com/wireguard/windows v0.3.16
+	golang.org/x/tools v0.1.6
+	golang.zx2c4.com/wireguard v0.0.0-20210905140043-2ef39d47540c
+	golang.zx2c4.com/wireguard/windows v0.4.9
 	honnef.co/go/tools v0.2.1
 	inet.af/netaddr v0.0.0-20210721214506-ce7a8ad02cc1
 	inet.af/netstack v0.0.0-20210622165351-29b14ebc044e
@@ -121,7 +121,7 @@ require (
 	github.com/kevinburke/ssh_config v0.0.0-20201106050909-4977a11b4351 // indirect
 	github.com/kisielk/gotool v1.0.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
-	github.com/kr/pretty v0.2.1 // indirect
+	github.com/kr/pretty v0.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kunwardeep/paralleltest v1.0.2 // indirect
 	github.com/kyoh86/exportloopref v0.1.8 // indirect
@@ -149,6 +149,7 @@ require (
 	github.com/polyfloyd/go-errorlint v0.0.0-20201127212506-19bd8db6546f // indirect
 	github.com/quasilyte/go-ruleguard v0.2.1 // indirect
 	github.com/quasilyte/regex/syntax v0.0.0-20200805063351-8f842688393c // indirect
+	github.com/rogpeppe/go-internal v1.6.2 // indirect
 	github.com/ryancurrah/gomodguard v1.1.0 // indirect
 	github.com/ryanrolds/sqlclosecheck v0.3.0 // indirect
 	github.com/sassoftware/go-rpmutils v0.0.0-20190420191620-a8f1baeba37b // indirect
@@ -181,7 +182,7 @@ require (
 	go4.org/intern v0.0.0-20210108033219-3eb7198706b2 // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20201222180813-1025295fd063 // indirect
 	golang.org/x/mod v0.4.2 // indirect
-	golang.org/x/text v0.3.7-0.20210524175448-3115f89c4b99 // indirect
+	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	gopkg.in/ini.v1 v1.62.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect

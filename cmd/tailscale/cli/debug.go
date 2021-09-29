@@ -34,13 +34,18 @@ var debugCmd = &ffcli.Command{
 		fs.BoolVar(&debugArgs.derpMap, "derp", false, "If true, dump DERP map")
 		fs.BoolVar(&debugArgs.pretty, "pretty", false, "If true, pretty-print output (for --prefs)")
 		fs.BoolVar(&debugArgs.netMap, "netmap", true, "whether to include netmap in --ipn mode")
+		fs.BoolVar(&debugArgs.env, "env", false, "dump environment")
 		fs.BoolVar(&debugArgs.localCreds, "local-creds", false, "print how to connect to local tailscaled")
 		fs.StringVar(&debugArgs.file, "file", "", "get, delete:NAME, or NAME")
+		fs.StringVar(&debugArgs.cpuFile, "cpu-profile", "", "if non-empty, grab a CPU profile for --profile-sec seconds and write it to this file; - for stdout")
+		fs.StringVar(&debugArgs.memFile, "mem-profile", "", "if non-empty, grab a memory profile and write it to this file; - for stdout")
+		fs.IntVar(&debugArgs.cpuSec, "profile-seconds", 15, "number of seconds to run a CPU profile for, when --cpu-profile is non-empty")
 		return fs
 	})(),
 }
 
 var debugArgs struct {
+	env        bool
 	localCreds bool
 	goroutines bool
 	ipn        bool
@@ -49,11 +54,38 @@ var debugArgs struct {
 	file       string
 	prefs      bool
 	pretty     bool
+	cpuSec     int
+	cpuFile    string
+	memFile    string
+}
+
+func writeProfile(dst string, v []byte) error {
+	if dst == "-" {
+		_, err := os.Stdout.Write(v)
+		return err
+	}
+	return os.WriteFile(dst, v, 0600)
+}
+
+func outName(dst string) string {
+	if dst == "-" {
+		return "stdout"
+	}
+	if runtime.GOOS == "darwin" {
+		return fmt.Sprintf("%s (warning: sandboxed macOS binaries write to Library/Containers; use - to write to stdout and redirect to file instead)", dst)
+	}
+	return dst
 }
 
 func runDebug(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		return errors.New("unknown arguments")
+	}
+	if debugArgs.env {
+		for _, e := range os.Environ() {
+			fmt.Println(e)
+		}
+		return nil
 	}
 	if debugArgs.localCreds {
 		port, token, err := safesocket.LocalTCPPortAndToken()
@@ -67,6 +99,28 @@ func runDebug(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("curl --unix-socket %s http://foo/localapi/v0/status\n", paths.DefaultTailscaledSocket())
 		return nil
+	}
+	if out := debugArgs.cpuFile; out != "" {
+		log.Printf("Capturing CPU profile for %v seconds ...", debugArgs.cpuSec)
+		if v, err := tailscale.Profile(ctx, "profile", debugArgs.cpuSec); err != nil {
+			return err
+		} else {
+			if err := writeProfile(out, v); err != nil {
+				return err
+			}
+			log.Printf("CPU profile written to %s", outName(out))
+		}
+	}
+	if out := debugArgs.memFile; out != "" {
+		log.Printf("Capturing memory profile ...")
+		if v, err := tailscale.Profile(ctx, "heap", 0); err != nil {
+			return err
+		} else {
+			if err := writeProfile(out, v); err != nil {
+				return err
+			}
+			log.Printf("Memory profile written to %s", outName(out))
+		}
 	}
 	if debugArgs.prefs {
 		prefs, err := tailscale.GetPrefs(ctx)

@@ -8,6 +8,7 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -62,10 +63,21 @@ func xdgDataHome() string {
 	return filepath.Join(os.Getenv("HOME"), ".local/share")
 }
 
-func ensureStateDirPerms(dirPath string) error {
-	// Unfortunately there are currently numerous tests that set up state files
-	// right off of /tmp, on which Chmod will of course fail. We should fix our
-	// test harnesses to not do that, at which point we can return an error.
-	os.Chmod(dirPath, 0700)
-	return nil
+func ensureStateDirPerms(dir string) error {
+	if filepath.Base(dir) != "tailscale" {
+		return nil
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("expected %q to be a directory; is %v", dir, fi.Mode())
+	}
+	const perm = 0700
+	if fi.Mode().Perm() == perm {
+		// Already correct.
+		return nil
+	}
+	return os.Chmod(dir, perm)
 }
