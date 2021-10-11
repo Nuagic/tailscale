@@ -6,7 +6,7 @@ require (
 	filippo.io/mkcert v1.4.3
 	github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
-	github.com/aws/aws-sdk-go v1.38.52
+	github.com/aws/aws-sdk-go v1.40.59
 	github.com/coreos/go-iptables v0.6.0
 	github.com/creack/pty v1.1.16
 	github.com/dave/jennifer v1.4.1
