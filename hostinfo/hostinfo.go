@@ -28,7 +28,7 @@ func New() *tailcfg.Hostinfo {
 		IPNVersion:  version.Long,
 		Hostname:    hostname,
 		OS:          version.OS(),
-		OSVersion:   getOSVersion(),
+		OSVersion:   GetOSVersion(),
 		Package:     packageType(),
 		GoArch:      runtime.GOARCH,
 		DeviceModel: deviceModel(),
@@ -37,7 +37,8 @@ func New() *tailcfg.Hostinfo {
 
 var osVersion func() string // non-nil on some platforms
 
-func getOSVersion() string {
+// GetOSVersion returns the OSVersion of current host if available.
+func GetOSVersion() string {
 	if s, _ := osVersionAtomic.Load().(string); s != "" {
 		return s
 	}
@@ -82,6 +83,7 @@ const (
 	AzureAppService = EnvType("az")
 	AWSFargate      = EnvType("fg")
 	FlyDotIo        = EnvType("fly")
+	Kubernetes      = EnvType("k8s")
 )
 
 var envType atomic.Value // of EnvType
@@ -135,6 +137,9 @@ func getEnvType() EnvType {
 	}
 	if inFlyDotIo() {
 		return FlyDotIo
+	}
+	if inKubernetes() {
+		return Kubernetes
 	}
 	return ""
 }
@@ -208,6 +213,13 @@ func inAWSFargate() bool {
 
 func inFlyDotIo() bool {
 	if os.Getenv("FLY_APP_NAME") != "" && os.Getenv("FLY_REGION") != "" {
+		return true
+	}
+	return false
+}
+
+func inKubernetes() bool {
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" && os.Getenv("KUBERNETES_SERVICE_PORT") != "" {
 		return true
 	}
 	return false
