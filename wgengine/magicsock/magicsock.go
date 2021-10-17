@@ -616,8 +616,13 @@ func (c *Conn) updateEndpoints(why string) {
 	}()
 	c.logf("[v1] magicsock: starting endpoint update (%s)", why)
 	if c.noV4Send.Get() {
-		c.logf("magicsock: last netcheck reported send error. Rebinding.")
-		c.Rebind()
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if !closed {
+			c.logf("magicsock: last netcheck reported send error. Rebinding.")
+			c.Rebind()
+		}
 	}
 
 	endpoints, err := c.determineEndpoints(c.connCtx)
@@ -1873,6 +1878,8 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netaddr.IPPort, di *discoInf
 	di.lastPingFrom = src
 	di.lastPingTime = time.Now()
 
+	isDerp := src.IP() == derpMagicIPAddr
+
 	// If we got a ping over DERP, then derpNodeSrc is non-zero and we reply
 	// over DERP (in which case ipDst is also a DERP address).
 	// But if the ping was over UDP (ipDst is not a DERP address), then dstKey
@@ -1881,14 +1888,14 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netaddr.IPPort, di *discoInf
 	dstKey := derpNodeSrc
 
 	// Remember this route if not present.
-	c.setAddrToDiscoLocked(src, di.discoKey)
 	var numNodes int
-	if !derpNodeSrc.IsZero() {
+	if isDerp {
 		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			ep.addCandidateEndpoint(src)
 			numNodes = 1
 		}
 	} else {
+		c.setAddrToDiscoLocked(src, di.discoKey)
 		c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) {
 			ep.addCandidateEndpoint(src)
 			numNodes++
