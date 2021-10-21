@@ -68,11 +68,19 @@ main() {
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
-			centos|ol)
+			centos)
 				OS="$ID"
 				VERSION="$VERSION_ID"
 				PACKAGETYPE="dnf"
-				if expr "$VERSION" : "7.*" >/dev/null; then
+				if [ "$VERSION" = "7" ]; then
+					PACKAGETYPE="yum"
+				fi
+				;;
+			ol)
+				OS="oracle"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
+				PACKAGETYPE="dnf"
+				if [ "$VERSION" = "7" ]; then
 					PACKAGETYPE="yum"
 				fi
 				;;
@@ -208,6 +216,13 @@ main() {
 			fi
 		;;
 		centos)
+			if [ "$VERSION" != "7" ] && \
+			   [ "$VERSION" != "8" ]
+			then
+				OS_UNSUPPORTED=1
+			fi
+		;;
+		oracle)
 			if [ "$VERSION" != "7" ] && \
 			   [ "$VERSION" != "8" ]
 			then
@@ -358,7 +373,7 @@ main() {
 			$SUDO mkdir -p --mode=0755 /usr/share/keyrings
 			case "$APT_KEY_TYPE" in
 				legacy)
-					$CURL "https://pkgs.tailscale.com/stable/$OS/$VERSION.gpg" | $SUDO apt-key add -
+					$CURL "https://pkgs.tailscale.com/stable/$OS/$VERSION.asc" | $SUDO apt-key add -
 					$CURL "https://pkgs.tailscale.com/stable/$OS/$VERSION.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
 				;;
 				keyring)

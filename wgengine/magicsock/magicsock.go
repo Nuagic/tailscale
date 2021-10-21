@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1013,6 +1014,9 @@ func (c *Conn) goDerpConnect(node int) {
 //
 // c.mu must NOT be held.
 func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, error) {
+	if runtime.GOOS == "js" {
+		return nil, nil
+	}
 	portmapExt, havePortmap := c.portMapper.GetCachedMappingOrStartCreatingOne()
 
 	nr, err := c.updateNetInfo(ctx)
@@ -1139,6 +1143,9 @@ func endpointSetsEqual(x, y []tailcfg.Endpoint) bool {
 
 // LocalPort returns the current IPv4 listener's port number.
 func (c *Conn) LocalPort() uint16 {
+	if runtime.GOOS == "js" {
+		return 12345
+	}
 	laddr := c.pconn4.LocalAddr()
 	return uint16(laddr.Port)
 }
@@ -2453,6 +2460,9 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	}
 	c.closed = false
 	fns := []conn.ReceiveFunc{c.receiveIPv4, c.receiveIPv6, c.receiveDERP}
+	if runtime.GOOS == "js" {
+		fns = []conn.ReceiveFunc{c.receiveDERP}
+	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
@@ -2473,8 +2483,12 @@ func (c *connBind) Close() error {
 	}
 	c.closed = true
 	// Unblock all outstanding receives.
-	c.pconn4.Close()
-	c.pconn6.Close()
+	if c.pconn4 != nil {
+		c.pconn4.Close()
+	}
+	if c.pconn6 != nil {
+		c.pconn6.Close()
+	}
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	c.derpRecvCh <- derpReadResult{}
@@ -2515,7 +2529,9 @@ func (c *Conn) Close() error {
 	if c.pconn6 != nil {
 		c.pconn6.Close()
 	}
-	c.pconn4.Close()
+	if c.pconn4 != nil {
+		c.pconn4.Close()
+	}
 
 	// Wait on goroutines updating right at the end, once everything is
 	// already closed. We want everything else in the Conn to be
@@ -2621,6 +2637,9 @@ func (c *Conn) ReSTUN(why string) {
 }
 
 func (c *Conn) initialBind() error {
+	if runtime.GOOS == "js" {
+		return nil
+	}
 	if err := c.bindSocket(&c.pconn4, "udp4", keepCurrentPort); err != nil {
 		return fmt.Errorf("magicsock: initialBind IPv4 failed: %w", err)
 	}
