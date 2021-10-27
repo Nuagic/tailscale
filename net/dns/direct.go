@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"inet.af/netaddr"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
 
@@ -76,28 +77,16 @@ func readResolv(r io.Reader) (config OSConfig, err error) {
 	return config, nil
 }
 
-func (m directManager) readResolvFile(path string) (OSConfig, error) {
-	b, err := m.fs.ReadFile(path)
-	if err != nil {
-		return OSConfig{}, err
-	}
-	return readResolv(bytes.NewReader(b))
-}
-
-// readResolvConf reads DNS configuration from /etc/resolv.conf.
-func (m directManager) readResolvConf() (OSConfig, error) {
-	return m.readResolvFile(resolvConf)
-}
-
 // resolvOwner returns the apparent owner of the resolv.conf
 // configuration in bs - one of "resolvconf", "systemd-resolved" or
 // "NetworkManager", or "" if no known owner was found.
 func resolvOwner(bs []byte) string {
+	likely := ""
 	b := bytes.NewBuffer(bs)
 	for {
 		line, err := b.ReadString('\n')
 		if err != nil {
-			return ""
+			return likely
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -106,15 +95,15 @@ func resolvOwner(bs []byte) string {
 		if line[0] != '#' {
 			// First non-empty, non-comment line. Assume the owner
 			// isn't hiding further down.
-			return ""
+			return likely
 		}
 
 		if strings.Contains(line, "systemd-resolved") {
-			return "systemd-resolved"
+			likely = "systemd-resolved"
 		} else if strings.Contains(line, "NetworkManager") {
-			return "NetworkManager"
+			likely = "NetworkManager"
 		} else if strings.Contains(line, "resolvconf") {
-			return "resolvconf"
+			likely = "resolvconf"
 		}
 	}
 }
@@ -146,20 +135,46 @@ func isResolvedRunning() bool {
 // The caller must call Down before program shutdown
 // or as cleanup if the program terminates unexpectedly.
 type directManager struct {
-	fs wholeFileFS
+	logf logger.Logf
+	fs   wholeFileFS
+	// renameBroken is set if fs.Rename to or from /etc/resolv.conf
+	// fails. This can happen in some container runtimes, where
+	// /etc/resolv.conf is bind-mounted from outside the container,
+	// and therefore /etc and /etc/resolv.conf are different
+	// filesystems as far as rename(2) is concerned.
+	//
+	// In those situations, we fall back to emulating rename with file
+	// copies and truncations, which is not as good (opens up a race
+	// where a reader can see an empty or partial /etc/resolv.conf),
+	// but is better than having non-functioning DNS.
+	renameBroken bool
 }
 
-func newDirectManager() directManager {
-	return directManager{fs: directFS{}}
+func newDirectManager(logf logger.Logf) *directManager {
+	return &directManager{
+		logf: logf,
+		fs:   directFS{},
+	}
 }
 
-func newDirectManagerOnFS(fs wholeFileFS) directManager {
-	return directManager{fs: fs}
+func newDirectManagerOnFS(logf logger.Logf, fs wholeFileFS) *directManager {
+	return &directManager{
+		logf: logf,
+		fs:   fs,
+	}
+}
+
+func (m *directManager) readResolvFile(path string) (OSConfig, error) {
+	b, err := m.fs.ReadFile(path)
+	if err != nil {
+		return OSConfig{}, err
+	}
+	return readResolv(bytes.NewReader(b))
 }
 
 // ownedByTailscale reports whether /etc/resolv.conf seems to be a
 // tailscale-managed file.
-func (m directManager) ownedByTailscale() (bool, error) {
+func (m *directManager) ownedByTailscale() (bool, error) {
 	isRegular, err := m.fs.Stat(resolvConf)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -182,7 +197,7 @@ func (m directManager) ownedByTailscale() (bool, error) {
 
 // backupConfig creates or updates a backup of /etc/resolv.conf, if
 // resolv.conf does not currently contain a Tailscale-managed config.
-func (m directManager) backupConfig() error {
+func (m *directManager) backupConfig() error {
 	if _, err := m.fs.Stat(resolvConf); err != nil {
 		if os.IsNotExist(err) {
 			// No resolv.conf, nothing to back up. Also get rid of any
@@ -201,10 +216,10 @@ func (m directManager) backupConfig() error {
 		return nil
 	}
 
-	return m.fs.Rename(resolvConf, backupConf)
+	return m.rename(resolvConf, backupConf)
 }
 
-func (m directManager) restoreBackup() (restored bool, err error) {
+func (m *directManager) restoreBackup() (restored bool, err error) {
 	if _, err := m.fs.Stat(backupConf); err != nil {
 		if os.IsNotExist(err) {
 			// No backup, nothing we can do.
@@ -230,14 +245,48 @@ func (m directManager) restoreBackup() (restored bool, err error) {
 	}
 
 	// We own resolv.conf, and a backup exists.
-	if err := m.fs.Rename(backupConf, resolvConf); err != nil {
+	if err := m.rename(backupConf, resolvConf); err != nil {
 		return false, err
 	}
 
 	return true, nil
 }
 
-func (m directManager) SetDNS(config OSConfig) (err error) {
+// rename tries to rename old to new using m.fs.Rename, and falls back
+// to hand-copying bytes and truncating old if that fails.
+//
+// This is a workaround to /etc/resolv.conf being a bind-mounted file
+// some container environments, which cannot be moved elsewhere in
+// /etc (because that would be a cross-filesystem move) or deleted
+// (because that would break the bind in surprising ways).
+func (m *directManager) rename(old, new string) error {
+	if !m.renameBroken {
+		err := m.fs.Rename(old, new)
+		if err == nil {
+			return nil
+		}
+		m.logf("rename of %q to %q failed (%v), falling back to copy+delete", old, new, err)
+		m.renameBroken = true
+	}
+
+	bs, err := m.fs.ReadFile(old)
+	if err != nil {
+		return fmt.Errorf("reading %q to rename: %v", old, err)
+	}
+	if err := m.fs.WriteFile(new, bs, 0644); err != nil {
+		return fmt.Errorf("writing to %q in rename of %q: %v", new, old, err)
+	}
+
+	if err := m.fs.Remove(old); err != nil {
+		err2 := m.fs.Truncate(old)
+		if err2 != nil {
+			return fmt.Errorf("remove of %q failed (%v) and so did truncate: %v", old, err, err2)
+		}
+	}
+	return nil
+}
+
+func (m *directManager) SetDNS(config OSConfig) (err error) {
 	var changed bool
 	if config.IsZero() {
 		changed, err = m.restoreBackup()
@@ -252,7 +301,7 @@ func (m directManager) SetDNS(config OSConfig) (err error) {
 
 		buf := new(bytes.Buffer)
 		writeResolvConf(buf, config.Nameservers, config.SearchDomains)
-		if err := atomicWriteFile(m.fs, resolvConf, buf.Bytes(), 0644); err != nil {
+		if err := m.atomicWriteFile(m.fs, resolvConf, buf.Bytes(), 0644); err != nil {
 			return err
 		}
 	}
@@ -280,11 +329,11 @@ func (m directManager) SetDNS(config OSConfig) (err error) {
 	return nil
 }
 
-func (m directManager) SupportsSplitDNS() bool {
+func (m *directManager) SupportsSplitDNS() bool {
 	return false
 }
 
-func (m directManager) GetBaseConfig() (OSConfig, error) {
+func (m *directManager) GetBaseConfig() (OSConfig, error) {
 	owned, err := m.ownedByTailscale()
 	if err != nil {
 		return OSConfig{}, err
@@ -297,7 +346,7 @@ func (m directManager) GetBaseConfig() (OSConfig, error) {
 	return m.readResolvFile(fileToRead)
 }
 
-func (m directManager) Close() error {
+func (m *directManager) Close() error {
 	// We used to keep a file for the tailscale config and symlinked
 	// to it, but then we stopped because /etc/resolv.conf being a
 	// symlink to surprising places breaks snaps and other sandboxing
@@ -329,7 +378,7 @@ func (m directManager) Close() error {
 	}
 
 	// We own resolv.conf, and a backup exists.
-	if err := m.fs.Rename(backupConf, resolvConf); err != nil {
+	if err := m.rename(backupConf, resolvConf); err != nil {
 		return err
 	}
 
@@ -340,7 +389,7 @@ func (m directManager) Close() error {
 	return nil
 }
 
-func atomicWriteFile(fs wholeFileFS, filename string, data []byte, perm os.FileMode) error {
+func (m *directManager) atomicWriteFile(fs wholeFileFS, filename string, data []byte, perm os.FileMode) error {
 	var randBytes [12]byte
 	if _, err := rand.Read(randBytes[:]); err != nil {
 		return fmt.Errorf("atomicWriteFile: %w", err)
@@ -352,7 +401,7 @@ func atomicWriteFile(fs wholeFileFS, filename string, data []byte, perm os.FileM
 	if err := fs.WriteFile(tmpName, data, perm); err != nil {
 		return fmt.Errorf("atomicWriteFile: %w", err)
 	}
-	return fs.Rename(tmpName, filename)
+	return m.rename(tmpName, filename)
 }
 
 // wholeFileFS is a high-level file system abstraction designed just for use
@@ -364,6 +413,7 @@ type wholeFileFS interface {
 	Rename(oldName, newName string) error
 	Remove(name string) error
 	ReadFile(name string) ([]byte, error)
+	Truncate(name string) error
 	WriteFile(name string, contents []byte, perm os.FileMode) error
 }
 
@@ -394,6 +444,10 @@ func (fs directFS) Remove(name string) error { return os.Remove(fs.path(name)) }
 
 func (fs directFS) ReadFile(name string) ([]byte, error) {
 	return ioutil.ReadFile(fs.path(name))
+}
+
+func (fs directFS) Truncate(name string) error {
+	return os.Truncate(fs.path(name), 0)
 }
 
 func (fs directFS) WriteFile(name string, contents []byte, perm os.FileMode) error {
