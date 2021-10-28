@@ -33,7 +33,7 @@ var netcheckCmd = &ffcli.Command{
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("netcheck", flag.ExitOnError)
+		fs := newFlagSet("netcheck")
 		fs.StringVar(&netcheckArgs.format, "format", "", `output format; empty (for human-readable), "json" or "json-line"`)
 		fs.DurationVar(&netcheckArgs.every, "every", 0, "if non-zero, do an incremental report with the given frequency")
 		fs.BoolVar(&netcheckArgs.verbose, "verbose", false, "verbose logs")
@@ -60,7 +60,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 	}
 
 	if strings.HasPrefix(netcheckArgs.format, "json") {
-		fmt.Fprintln(os.Stderr, "# Warning: this JSON format is not yet considered a stable interface")
+		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
 	}
 
 	dm, err := tailscale.CurrentDERPMap(ctx)
@@ -82,7 +82,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 			c.Logf("GetReport took %v; err=%v", d.Round(time.Millisecond), err)
 		}
 		if err != nil {
-			log.Fatalf("netcheck: %v", err)
+			return fmt.Errorf("netcheck: %w", err)
 		}
 		if err := printReport(dm, report); err != nil {
 			return err
@@ -112,36 +112,36 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	}
 	if j != nil {
 		j = append(j, '\n')
-		os.Stdout.Write(j)
+		Stdout.Write(j)
 		return nil
 	}
 
-	fmt.Printf("\nReport:\n")
-	fmt.Printf("\t* UDP: %v\n", report.UDP)
+	printf("\nReport:\n")
+	printf("\t* UDP: %v\n", report.UDP)
 	if report.GlobalV4 != "" {
-		fmt.Printf("\t* IPv4: yes, %v\n", report.GlobalV4)
+		printf("\t* IPv4: yes, %v\n", report.GlobalV4)
 	} else {
-		fmt.Printf("\t* IPv4: (no addr found)\n")
+		printf("\t* IPv4: (no addr found)\n")
 	}
 	if report.GlobalV6 != "" {
-		fmt.Printf("\t* IPv6: yes, %v\n", report.GlobalV6)
+		printf("\t* IPv6: yes, %v\n", report.GlobalV6)
 	} else if report.IPv6 {
-		fmt.Printf("\t* IPv6: (no addr found)\n")
+		printf("\t* IPv6: (no addr found)\n")
 	} else {
-		fmt.Printf("\t* IPv6: no\n")
+		printf("\t* IPv6: no\n")
 	}
-	fmt.Printf("\t* MappingVariesByDestIP: %v\n", report.MappingVariesByDestIP)
-	fmt.Printf("\t* HairPinning: %v\n", report.HairPinning)
-	fmt.Printf("\t* PortMapping: %v\n", portMapping(report))
+	printf("\t* MappingVariesByDestIP: %v\n", report.MappingVariesByDestIP)
+	printf("\t* HairPinning: %v\n", report.HairPinning)
+	printf("\t* PortMapping: %v\n", portMapping(report))
 
 	// When DERP latency checking failed,
 	// magicsock will try to pick the DERP server that
 	// most of your other nodes are also using
 	if len(report.RegionLatency) == 0 {
-		fmt.Printf("\t* Nearest DERP: unknown (no response to latency probes)\n")
+		printf("\t* Nearest DERP: unknown (no response to latency probes)\n")
 	} else {
-		fmt.Printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
-		fmt.Printf("\t* DERP latency:\n")
+		printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+		printf("\t* DERP latency:\n")
 		var rids []int
 		for rid := range dm.Regions {
 			rids = append(rids, rid)
@@ -168,7 +168,7 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 			if netcheckArgs.verbose {
 				derpNum = fmt.Sprintf("derp%d, ", rid)
 			}
-			fmt.Printf("\t\t- %3s: %-7s (%s%s)\n", r.RegionCode, latency, derpNum, r.RegionName)
+			printf("\t\t- %3s: %-7s (%s%s)\n", r.RegionCode, latency, derpNum, r.RegionName)
 		}
 	}
 	return nil

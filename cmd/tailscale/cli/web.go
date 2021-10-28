@@ -76,7 +76,7 @@ Tailscale, as opposed to a CLI or a native app.
 `),
 
 	FlagSet: (func() *flag.FlagSet {
-		webf := flag.NewFlagSet("web", flag.ExitOnError)
+		webf := newFlagSet("web")
 		webf.StringVar(&webArgs.listen, "listen", "localhost:8088", "listen address; use port 0 for automatic")
 		webf.BoolVar(&webArgs.cgi, "cgi", false, "run as CGI script")
 		return webf
@@ -114,7 +114,7 @@ func tlsConfigFromEnvironment() *tls.Config {
 
 func runWeb(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		log.Fatalf("too many non-flag arguments: %q", args)
+		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 
 	if webArgs.cgi {

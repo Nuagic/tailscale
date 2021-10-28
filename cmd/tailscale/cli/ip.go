@@ -23,7 +23,7 @@ var ipCmd = &ffcli.Command{
 	LongHelp:   "Shows the Tailscale IP address of the current machine without an argument. With an argument, it shows the IP of a named peer.",
 	Exec:       runIP,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("ip", flag.ExitOnError)
+		fs := newFlagSet("ip")
 		fs.BoolVar(&ipArgs.want4, "4", false, "only print IPv4 address")
 		fs.BoolVar(&ipArgs.want6, "6", false, "only print IPv6 address")
 		return fs
@@ -75,7 +75,7 @@ func runIP(ctx context.Context, args []string) error {
 	for _, ip := range ips {
 		if ip.Is4() && v4 || ip.Is6() && v6 {
 			match = true
-			fmt.Println(ip)
+			outln(ip)
 		}
 	}
 	if !match {

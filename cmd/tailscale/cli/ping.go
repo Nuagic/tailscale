@@ -45,7 +45,7 @@ relay node.
 `),
 	Exec: runPing,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("ping", flag.ExitOnError)
+		fs := newFlagSet("ping")
 		fs.BoolVar(&pingArgs.verbose, "verbose", false, "verbose output")
 		fs.BoolVar(&pingArgs.untilDirect, "until-direct", true, "stop once a direct path is established")
 		fs.BoolVar(&pingArgs.tsmp, "tsmp", false, "do a TSMP-level ping (through IP + wireguard, but not involving host OS stack)")
@@ -74,7 +74,7 @@ func runPing(ctx context.Context, args []string) error {
 	prc := make(chan *ipnstate.PingResult, 1)
 	bc.SetNotifyCallback(func(n ipn.Notify) {
 		if n.ErrMessage != nil {
-			log.Fatal(*n.ErrMessage)
+			fatalf("Notify.ErrMessage: %v", *n.ErrMessage)
 		}
 		if pr := n.PingResult; pr != nil && pr.IP == ip {
 			prc <- pr
@@ -89,7 +89,7 @@ func runPing(ctx context.Context, args []string) error {
 		return err
 	}
 	if self {
-		fmt.Printf("%v is local Tailscale IP\n", ip)
+		printf("%v is local Tailscale IP\n", ip)
 		return nil
 	}
 
@@ -105,14 +105,14 @@ func runPing(ctx context.Context, args []string) error {
 		timer := time.NewTimer(pingArgs.timeout)
 		select {
 		case <-timer.C:
-			fmt.Printf("timeout waiting for ping reply\n")
+			printf("timeout waiting for ping reply\n")
 		case err := <-pumpErr:
 			return err
 		case pr := <-prc:
 			timer.Stop()
 			if pr.Err != "" {
 				if pr.IsLocalIP {
-					fmt.Println(pr.Err)
+					outln(pr.Err)
 					return nil
 				}
 				return errors.New(pr.Err)
@@ -132,7 +132,7 @@ func runPing(ctx context.Context, args []string) error {
 			if pr.PeerAPIPort != 0 {
 				extra = fmt.Sprintf(", %d", pr.PeerAPIPort)
 			}
-			fmt.Printf("pong from %s (%s%s) via %v in %v\n", pr.NodeName, pr.NodeIP, extra, via, latency)
+			printf("pong from %s (%s%s) via %v in %v\n", pr.NodeName, pr.NodeIP, extra, via, latency)
 			if pingArgs.tsmp {
 				return nil
 			}
