@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go4.org/mem"
 	"golang.org/x/crypto/nacl/box"
 	"golang.zx2c4.com/wireguard/conn"
 	"inet.af/netaddr"
@@ -51,7 +52,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/util/uniq"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/monitor"
@@ -1340,7 +1340,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 
 	// Note that derphttp.NewRegionClient does not dial the server
 	// so it is safe to do under the mu lock.
-	dc := derphttp.NewRegionClient(c.privateKey, c.logf, func() *tailcfg.DERPRegion {
+	dc := derphttp.NewRegionClient(key.NodePrivateFromRaw32(mem.B(c.privateKey[:])), c.logf, func() *tailcfg.DERPRegion {
 		if c.connCtx.Err() != nil {
 			// If we're closing, don't try to acquire the lock.
 			// We might already be in Conn.Close and the Lock would deadlock.
@@ -1539,15 +1539,15 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 		case derp.ReceivedPacket:
 			pkt = m
 			res.n = len(m.Data)
-			res.src = m.Source
+			res.src = m.Source.AsPublic()
 			if logDerpVerbose {
 				c.logf("magicsock: got derp-%v packet: %q", regionID, m.Data)
 			}
 			// If this is a new sender we hadn't seen before, remember it and
 			// register a route for this peer.
-			if _, ok := peerPresent[m.Source]; !ok {
-				peerPresent[m.Source] = true
-				c.addDerpPeerRoute(m.Source, regionID, dc)
+			if _, ok := peerPresent[res.src]; !ok {
+				peerPresent[res.src] = true
+				c.addDerpPeerRoute(res.src, regionID, dc)
 			}
 		case derp.PingMessage:
 			// Best effort reply to the ping.
@@ -1601,7 +1601,7 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
-			err := dc.Send(wr.pubKey, wr.b)
+			err := dc.Send(key.NodePublicFromRaw32(mem.B(wr.pubKey[:])), wr.b)
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 			}
@@ -2123,11 +2123,11 @@ func (c *Conn) SetPreferredPort(port uint16) {
 //
 // If the private key changes, any DERP connections are torn down &
 // recreated when needed.
-func (c *Conn) SetPrivateKey(privateKey wgkey.Private) error {
+func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	oldKey, newKey := c.privateKey, key.Private(privateKey)
+	oldKey, newKey := c.privateKey, privateKey.AsPrivate()
 	if newKey == oldKey {
 		return nil
 	}
@@ -2277,7 +2277,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			ep.discoKey = n.DiscoKey
 			ep.discoShort = n.DiscoKey.ShortString()
 		}
-		ep.wgEndpoint = (wgkey.Key(n.Key)).HexString()
+		ep.wgEndpoint = key.NodePublicFromRaw32(mem.B(n.Key[:])).UntypedHexString()
 		ep.initFakeUDPAddr()
 		c.logf("magicsock: created endpoint key=%s: disco=%s; %v", n.Key.ShortString(), n.DiscoKey.ShortString(), logger.ArgWriter(func(w *bufio.Writer) {
 			const derpPrefix = "127.3.3.40:"
@@ -2819,18 +2819,18 @@ func packIPPort(ua netaddr.IPPort) []byte {
 
 // ParseEndpoint is called by WireGuard to connect to an endpoint.
 func (c *Conn) ParseEndpoint(nodeKeyStr string) (conn.Endpoint, error) {
-	k, err := wgkey.ParseHex(nodeKeyStr)
+	k, err := key.ParseNodePublicUntyped(mem.S(nodeKeyStr))
 	if err != nil {
 		return nil, fmt.Errorf("magicsock: ParseEndpoint: parse failed on %q: %w", nodeKeyStr, err)
 	}
-	pk := tailcfg.NodeKey(k)
+	pk := tailcfg.NodeKeyFromNodePublic(k)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil, errConnClosed
 	}
-	ep, ok := c.peerMap.endpointForNodeKey(tailcfg.NodeKey(pk))
+	ep, ok := c.peerMap.endpointForNodeKey(pk)
 	if !ok {
 		// We should never be telling WireGuard about a new peer
 		// before magicsock knows about it.
@@ -3019,8 +3019,7 @@ func simpleDur(d time.Duration) time.Duration {
 }
 
 func peerShort(k key.Public) string {
-	k2 := wgkey.Key(k)
-	return k2.ShortString()
+	return key.NodePublicFromRaw32(mem.B(k[:])).ShortString()
 }
 
 func sbPrintAddr(sb *strings.Builder, a netaddr.IPPort) {

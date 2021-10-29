@@ -24,6 +24,7 @@ import (
 	"time"
 	"unsafe"
 
+	"go4.org/mem"
 	"golang.org/x/crypto/nacl/box"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
@@ -40,7 +41,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/wgengine/filter"
@@ -81,11 +81,7 @@ func (c *Conn) WaitReady(t testing.TB) {
 }
 
 func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, stunIP netaddr.IP) (derpMap *tailcfg.DERPMap, cleanup func()) {
-	var serverPrivateKey key.Private
-	if _, err := crand.Read(serverPrivateKey[:]); err != nil {
-		t.Fatal(err)
-	}
-	d := derp.NewServer(serverPrivateKey, logf)
+	d := derp.NewServer(key.NewNode(), logf)
 
 	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -130,7 +126,7 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, st
 // necessary to send and receive packets to test e2e wireguard
 // happiness.
 type magicStack struct {
-	privateKey wgkey.Private
+	privateKey key.NodePrivate
 	epCh       chan []tailcfg.Endpoint // endpoint updates produced by this peer
 	conn       *Conn                   // the magicsock itself
 	tun        *tuntest.ChannelTUN     // TUN device to send/receive packets
@@ -143,15 +139,11 @@ type magicStack struct {
 // friends. You need to call conn.SetNetworkMap and dev.Reconfig
 // before anything interesting happens.
 func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
-	privateKey, err := wgkey.NewPrivate()
-	if err != nil {
-		t.Fatalf("generating private key: %v", err)
-	}
-
+	privateKey := key.NewNode()
 	return newMagicStackWithKey(t, logf, l, derpMap, privateKey)
 }
 
-func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey wgkey.Private) *magicStack {
+func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
 	t.Helper()
 
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
@@ -214,7 +206,7 @@ func (s *magicStack) Close() {
 }
 
 func (s *magicStack) Public() key.Public {
-	return key.Public(s.privateKey.Public())
+	return s.privateKey.Public().AsPublic()
 }
 
 func (s *magicStack) Status() *ipnstate.Status {
@@ -256,7 +248,7 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 		me := ms[myIdx]
 		nm := &netmap.NetworkMap{
 			PrivateKey: me.privateKey,
-			NodeKey:    tailcfg.NodeKey(me.privateKey.Public()),
+			NodeKey:    tailcfg.NodeKeyFromNodePublic(me.privateKey.Public()),
 			Addresses:  []netaddr.IPPrefix{netaddr.IPPrefixFrom(netaddr.IPv4(1, 0, 0, byte(myIdx+1)), 32)},
 		}
 		for i, peer := range ms {
@@ -267,7 +259,7 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 			peer := &tailcfg.Node{
 				ID:         tailcfg.NodeID(i + 1),
 				Name:       fmt.Sprintf("node%d", i+1),
-				Key:        tailcfg.NodeKey(peer.privateKey.Public()),
+				Key:        tailcfg.NodeKeyFromNodePublic(peer.privateKey.Public()),
 				DiscoKey:   peer.conn.DiscoPublicKey(),
 				Addresses:  addrs,
 				AllowedIPs: addrs,
@@ -362,7 +354,7 @@ func TestNewConn(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
-	conn.SetPrivateKey(wgkey.Private(key.NewPrivate()))
+	conn.SetPrivateKey(key.NewNode())
 
 	go func() {
 		var pkt [64 << 10]byte
@@ -665,10 +657,7 @@ func TestDiscokeyChange(t *testing.T) {
 	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
 	defer cleanup()
 
-	m1Key, err := wgkey.NewPrivate()
-	if err != nil {
-		t.Fatalf("generating nodekey: %v", err)
-	}
+	m1Key := key.NewNode()
 	m1 := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, m1Key)
 	defer m1.Close()
 	m2 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
@@ -1006,10 +995,10 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 
 	// Wait for magicsock to be told about peers from meshStacks.
 	tstest.WaitFor(10*time.Second, func() error {
-		if p := m1.Status().Peer[key.Public(m2.privateKey.Public())]; p == nil || !p.InMagicSock {
+		if p := m1.Status().Peer[m2.privateKey.Public().AsPublic()]; p == nil || !p.InMagicSock {
 			return errors.New("m1 not ready")
 		}
-		if p := m2.Status().Peer[key.Public(m1.privateKey.Public())]; p == nil || !p.InMagicSock {
+		if p := m2.Status().Peer[m1.privateKey.Public().AsPublic()]; p == nil || !p.InMagicSock {
 			return errors.New("m2 not ready")
 		}
 		return nil
@@ -1240,23 +1229,24 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcf
 	// valid peer and not fall through to the legacy magicsock
 	// codepath.
 	discoKey := tailcfg.DiscoKey{31: 1}
-	nodeKey := tailcfg.NodeKey{0: 'N', 1: 'K'}
+	nodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 31: 0}))
+	tnk := tailcfg.NodeKeyFromNodePublic(nodeKey)
 	conn.SetNetworkMap(&netmap.NetworkMap{
 		Peers: []*tailcfg.Node{
 			{
-				Key:       nodeKey,
+				Key:       tnk,
 				DiscoKey:  discoKey,
 				Endpoints: []string{sendConn.LocalAddr().String()},
 			},
 		},
 	})
-	conn.SetPrivateKey(wgkey.Private{0: 1})
-	_, err := conn.ParseEndpoint(wgkey.Key(nodeKey).HexString())
+	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
+	_, err := conn.ParseEndpoint(nodeKey.UntypedHexString())
 	if err != nil {
 		tb.Fatal(err)
 	}
-	conn.addValidDiscoPathForTest(nodeKey, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
-	return nodeKey, discoKey
+	conn.addValidDiscoPathForTest(tnk, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
+	return tnk, discoKey
 }
 
 func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
@@ -1346,17 +1336,21 @@ func TestReceiveFromAllocs(t *testing.T) {
 		t.Skip("alloc tests are unreliable with -race")
 	}
 	// Go 1.16 and before: allow 3 allocs.
-	// Go Tailscale fork, Go 1.17+: only allow 2 allocs.
+	// Go 1.17: allow 2 allocs.
+	// Go Tailscale fork, Go 1.18+: allow 1 alloc.
 	major, ts := goMajorVersion(runtime.Version())
 	maxAllocs := 3
-	if major >= 17 || ts {
+	switch {
+	case major == 17:
 		maxAllocs = 2
+	case major >= 18, ts:
+		maxAllocs = 1
 	}
 	t.Logf("allowing %d allocs for Go version %q", maxAllocs, runtime.Version())
 	roundTrip := setUpReceiveFrom(t)
-	avg := int(testing.AllocsPerRun(1000, roundTrip))
-	if avg > maxAllocs {
-		t.Fatalf("expected %d allocs in ReceiveFrom, got %v", maxAllocs, avg)
+	err := tstest.MinAllocsPerRun(t, uint64(maxAllocs), roundTrip)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1409,7 +1403,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	var buf tstest.MemLogger
 	conn.logf = buf.Logf
 
-	conn.SetPrivateKey(wgkey.Private{0: 1})
+	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
 
 	discoKey := tailcfg.DiscoKey{31: 1}
 	nodeKey1 := tailcfg.NodeKey{0: 'N', 1: 'K', 2: '1'}
@@ -1424,7 +1418,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 			},
 		},
 	})
-	_, err := conn.ParseEndpoint(wgkey.Key(nodeKey1).HexString())
+	_, err := conn.ParseEndpoint(key.NodePublicFromRaw32(mem.B(nodeKey1[:])).UntypedHexString())
 	if err != nil {
 		t.Fatal(err)
 	}

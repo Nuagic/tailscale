@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/tstest"
 	"tailscale.com/types/key"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/version"
 )
 
@@ -205,15 +205,7 @@ func TestNodeEqual(t *testing.T) {
 			have, nodeHandles)
 	}
 
-	newPublicKey := func(t *testing.T) wgkey.Key {
-		t.Helper()
-		k, err := wgkey.NewPrivate()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return k.Public()
-	}
-	n1 := newPublicKey(t)
+	n1 := key.NewNode().Public()
 	m1 := key.NewMachine().Public()
 	now := time.Now()
 
@@ -272,13 +264,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Key: NodeKey(n1)},
-			&Node{Key: NodeKey(newPublicKey(t))},
+			&Node{Key: NodeKeyFromNodePublic(n1)},
+			&Node{Key: NodeKeyFromNodePublic(key.NewNode().Public())},
 			false,
 		},
 		{
-			&Node{Key: NodeKey(n1)},
-			&Node{Key: NodeKey(n1)},
+			&Node{Key: NodeKeyFromNodePublic(n1)},
+			&Node{Key: NodeKeyFromNodePublic(n1)},
 			true,
 		},
 		{
@@ -550,11 +542,11 @@ func TestAppendKeyAllocs(t *testing.T) {
 		t.Skip("skipping in race detector") // append(b, make([]byte, N)...) not optimized in compiler with race
 	}
 	var k [32]byte
-	n := int(testing.AllocsPerRun(1000, func() {
+	err := tstest.MinAllocsPerRun(t, 1, func() {
 		sinkBytes = keyMarshalText("prefix", k)
-	}))
-	if n != 1 {
-		t.Fatalf("allocs = %v; want 1", n)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

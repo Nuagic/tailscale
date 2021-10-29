@@ -13,10 +13,13 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/go-multierror/multierror"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
 	"golang.zx2c4.com/wireguard/tun"
 	"inet.af/netaddr"
@@ -55,33 +58,14 @@ const (
 	// Packet is from Tailscale and to a subnet route destination, so
 	// is allowed to be routed through this machine.
 	tailscaleSubnetRouteMark = "0x40000"
+
 	// Packet was originated by tailscaled itself, and must not be
 	// routed over the Tailscale network.
 	//
 	// Keep this in sync with tailscaleBypassMark in
 	// net/netns/netns_linux.go.
-	tailscaleBypassMark = "0x80000"
-)
-
-const (
-	defaultRouteTable = "default"
-	mainRouteTable    = "main"
-
-	// tailscaleRouteTable is the routing table number for Tailscale
-	// network routes. See addIPRules for the detailed policy routing
-	// logic that ends up doing lookups within that table.
-	//
-	// NOTE(danderson): We chose 52 because those are the digits above the
-	// letters "TS" on a qwerty keyboard, and 52 is sufficiently unlikely
-	// to be picked by other software.
-	//
-	// NOTE(danderson): You might wonder why we didn't pick some high
-	// table number like 5252, to further avoid the potential for
-	// collisions with other software. Unfortunately, Busybox's `ip`
-	// implementation believes that table numbers are 8-bit integers, so
-	// for maximum compatibility we have to stay in the 0-255 range even
-	// though linux itself supports larger numbers.
-	tailscaleRouteTable = "52"
+	tailscaleBypassMark    = "0x80000"
+	tailscaleBypassMarkNum = 0x80000
 )
 
 // netfilterRunner abstracts helpers to run netfilter commands. It
@@ -194,6 +178,17 @@ func useAmbientCaps() bool {
 		return false
 	}
 	return v >= 7
+}
+
+// useIPCommand reports whether r should use the "ip" command (or its
+// fake commandRunner for tests) instead of netlink.
+func (r *linuxRouter) useIPCommand() bool {
+	// In the future we might need to fall back to using the "ip"
+	// command if, say, netlink is blocked somewhere but the ip
+	// command is allowed to use netlink. For now we only use the ip
+	// command runner in tests.
+	_, ok := r.cmd.(osCommandRunner)
+	return !ok
 }
 
 // onIPRuleDeleted is the callback from the link monitor for when an IP policy
@@ -449,8 +444,18 @@ func (r *linuxRouter) addAddress(addr netaddr.IPPrefix) error {
 	if !r.v6Available && addr.IP().Is6() {
 		return nil
 	}
-	if err := r.cmd.run("ip", "addr", "add", addr.String(), "dev", r.tunname); err != nil {
-		return fmt.Errorf("adding address %q to tunnel interface: %w", addr, err)
+	if r.useIPCommand() {
+		if err := r.cmd.run("ip", "addr", "add", addr.String(), "dev", r.tunname); err != nil {
+			return fmt.Errorf("adding address %q to tunnel interface: %w", addr, err)
+		}
+	} else {
+		link, err := r.link()
+		if err != nil {
+			return fmt.Errorf("adding address %v, %w", addr, err)
+		}
+		if err := netlink.AddrReplace(link, nlAddrOfPrefix(addr)); err != nil {
+			return fmt.Errorf("adding address %v from tunnel interface: %w", addr, err)
+		}
 	}
 	if err := r.addLoopbackRule(addr.IP()); err != nil {
 		return err
@@ -468,8 +473,18 @@ func (r *linuxRouter) delAddress(addr netaddr.IPPrefix) error {
 	if err := r.delLoopbackRule(addr.IP()); err != nil {
 		return err
 	}
-	if err := r.cmd.run("ip", "addr", "del", addr.String(), "dev", r.tunname); err != nil {
-		return fmt.Errorf("deleting address %q from tunnel interface: %w", addr, err)
+	if r.useIPCommand() {
+		if err := r.cmd.run("ip", "addr", "del", addr.String(), "dev", r.tunname); err != nil {
+			return fmt.Errorf("deleting address %q from tunnel interface: %w", addr, err)
+		}
+	} else {
+		link, err := r.link()
+		if err != nil {
+			return fmt.Errorf("deleting address %v, %w", addr, err)
+		}
+		if err := netlink.AddrDel(link, nlAddrOfPrefix(addr)); err != nil {
+			return fmt.Errorf("deleting address %v from tunnel interface: %w", addr, err)
+		}
 	}
 	return nil
 }
@@ -522,7 +537,21 @@ func (r *linuxRouter) delLoopbackRule(addr netaddr.IP) error {
 // interface. Fails if the route already exists, or if adding the
 // route fails.
 func (r *linuxRouter) addRoute(cidr netaddr.IPPrefix) error {
-	return r.addRouteDef([]string{normalizeCIDR(cidr), "dev", r.tunname}, cidr)
+	if !r.v6Available && cidr.IP().Is6() {
+		return nil
+	}
+	if r.useIPCommand() {
+		return r.addRouteDef([]string{normalizeCIDR(cidr), "dev", r.tunname}, cidr)
+	}
+	linkIndex, err := r.linkIndex()
+	if err != nil {
+		return err
+	}
+	return netlink.RouteReplace(&netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       cidr.Masked().IPNet(),
+		Table:     r.routeTable(),
+	})
 }
 
 // addThrowRoute adds a throw route for the provided cidr.
@@ -533,7 +562,21 @@ func (r *linuxRouter) addThrowRoute(cidr netaddr.IPPrefix) error {
 	if !r.ipRuleAvailable {
 		return nil
 	}
-	return r.addRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
+	if !r.v6Available && cidr.IP().Is6() {
+		return nil
+	}
+	if r.useIPCommand() {
+		return r.addRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
+	}
+	err := netlink.RouteReplace(&netlink.Route{
+		Dst:   cidr.Masked().IPNet(),
+		Table: tailscaleRouteTable.num,
+		Type:  unix.RTN_THROW,
+	})
+	if err != nil {
+		r.logf("THROW ERROR adding %v: %#v", cidr, err)
+	}
+	return err
 }
 
 func (r *linuxRouter) addRouteDef(routeDef []string, cidr netaddr.IPPrefix) error {
@@ -542,18 +585,18 @@ func (r *linuxRouter) addRouteDef(routeDef []string, cidr netaddr.IPPrefix) erro
 	}
 	args := append([]string{"ip", "route", "add"}, routeDef...)
 	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable)
+		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
 	}
 	err := r.cmd.run(args...)
 	if err == nil {
 		return nil
 	}
 
-	// TODO(bradfitz): remove this ugly hack to detect failure to
-	// add a route that already exists (as happens in when we're
-	// racing to add kernel-maintained routes when enabling exit
-	// nodes w/o Local LAN access, Issue 3060) and use netlink
-	// directly instead (Issue 391).
+	// This is an ugly hack to detect failure to add a route that
+	// already exists (as happens in when we're racing to add
+	// kernel-maintained routes when enabling exit nodes w/o Local
+	// LAN access, Issue 3060). Fortunately in the common case we
+	// use netlink directly instead and don't exercise this code.
 	if errCode(err) == 2 && strings.Contains(err.Error(), "RTNETLINK answers: File exists") {
 		r.logf("ignoring route add of %v; already exists", cidr)
 		return nil
@@ -561,11 +604,32 @@ func (r *linuxRouter) addRouteDef(routeDef []string, cidr netaddr.IPPrefix) erro
 	return err
 }
 
+var errESRCH error = syscall.ESRCH
+
 // delRoute removes the route for cidr pointing to the tunnel
 // interface. Fails if the route doesn't exist, or if removing the
 // route fails.
 func (r *linuxRouter) delRoute(cidr netaddr.IPPrefix) error {
-	return r.delRouteDef([]string{normalizeCIDR(cidr), "dev", r.tunname}, cidr)
+	if !r.v6Available && cidr.IP().Is6() {
+		return nil
+	}
+	if r.useIPCommand() {
+		return r.delRouteDef([]string{normalizeCIDR(cidr), "dev", r.tunname}, cidr)
+	}
+	linkIndex, err := r.linkIndex()
+	if err != nil {
+		return err
+	}
+	err = netlink.RouteDel(&netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       cidr.Masked().IPNet(),
+		Table:     r.routeTable(),
+	})
+	if errors.Is(err, errESRCH) {
+		// Didn't exist to begin with.
+		return nil
+	}
+	return err
 }
 
 // delThrowRoute removes the throw route for the cidr. Fails if the route
@@ -574,7 +638,22 @@ func (r *linuxRouter) delThrowRoute(cidr netaddr.IPPrefix) error {
 	if !r.ipRuleAvailable {
 		return nil
 	}
-	return r.delRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
+	if !r.v6Available && cidr.IP().Is6() {
+		return nil
+	}
+	if r.useIPCommand() {
+		return r.delRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
+	}
+	err := netlink.RouteDel(&netlink.Route{
+		Dst:   cidr.Masked().IPNet(),
+		Table: r.routeTable(),
+		Type:  unix.RTN_THROW,
+	})
+	if errors.Is(err, errESRCH) {
+		// Didn't exist to begin with.
+		return nil
+	}
+	return err
 }
 
 func (r *linuxRouter) delRouteDef(routeDef []string, cidr netaddr.IPPrefix) error {
@@ -583,7 +662,7 @@ func (r *linuxRouter) delRouteDef(routeDef []string, cidr netaddr.IPPrefix) erro
 	}
 	args := append([]string{"ip", "route", "del"}, routeDef...)
 	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable)
+		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
 	}
 	err := r.cmd.run(args...)
 	if err != nil {
@@ -610,7 +689,7 @@ func dashFam(ip netaddr.IP) string {
 func (r *linuxRouter) hasRoute(routeDef []string, cidr netaddr.IPPrefix) (bool, error) {
 	args := append([]string{"ip", dashFam(cidr.IP()), "route", "show"}, routeDef...)
 	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable)
+		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
 	}
 	out, err := r.cmd.output(args...)
 	if err != nil {
@@ -619,21 +698,79 @@ func (r *linuxRouter) hasRoute(routeDef []string, cidr netaddr.IPPrefix) (bool, 
 	return len(out) > 0, nil
 }
 
+func (r *linuxRouter) link() (netlink.Link, error) {
+	link, err := netlink.LinkByName(r.tunname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up link %q: %w", r.tunname, err)
+	}
+	return link, nil
+}
+
+func (r *linuxRouter) linkIndex() (int, error) {
+	// TODO(bradfitz): cache this? It doesn't change often, and on start-up
+	// hundreds of addRoute calls to add /32s can happen quickly.
+	link, err := r.link()
+	if err != nil {
+		return 0, err
+	}
+	return link.Attrs().Index, nil
+}
+
+// routeTable returns the route table to use.
+func (r *linuxRouter) routeTable() int {
+	if r.ipRuleAvailable {
+		return tailscaleRouteTable.num
+	}
+	return 0
+}
+
 // upInterface brings up the tunnel interface.
 func (r *linuxRouter) upInterface() error {
-	return r.cmd.run("ip", "link", "set", "dev", r.tunname, "up")
+	if r.useIPCommand() {
+		return r.cmd.run("ip", "link", "set", "dev", r.tunname, "up")
+	}
+	link, err := r.link()
+	if err != nil {
+		return fmt.Errorf("bringing interface up, %w", err)
+	}
+	return netlink.LinkSetUp(link)
 }
 
 // downInterface sets the tunnel interface administratively down.
 func (r *linuxRouter) downInterface() error {
-	return r.cmd.run("ip", "link", "set", "dev", r.tunname, "down")
+	if r.useIPCommand() {
+		return r.cmd.run("ip", "link", "set", "dev", r.tunname, "down")
+	}
+	link, err := r.link()
+	if err != nil {
+		return fmt.Errorf("bringing interface down, %w", err)
+	}
+	return netlink.LinkSetDown(link)
 }
 
-func (r *linuxRouter) iprouteFamilies() []string {
-	if r.v6Available {
-		return []string{"-4", "-6"}
+// addrFamily is an address family: IPv4 or IPv6.
+type addrFamily byte
+
+const (
+	v4 = addrFamily(4)
+	v6 = addrFamily(6)
+)
+
+func (f addrFamily) dashArg() string {
+	switch f {
+	case 4:
+		return "-4"
+	case 6:
+		return "-6"
 	}
-	return []string{"-4"}
+	panic("illegal")
+}
+
+func (r *linuxRouter) addrFamilies() []addrFamily {
+	if r.v6Available {
+		return []addrFamily{v4, v6}
+	}
+	return []addrFamily{v4}
 }
 
 // addIPRules adds the policy routing rule that avoids tailscaled
@@ -653,6 +790,109 @@ func (r *linuxRouter) addIPRules() error {
 	return r.justAddIPRules()
 }
 
+// routeTable is a Linux routing table: both its name and number.
+// See /etc/iproute2/rt_tables.
+type routeTable struct {
+	name string
+	num  int
+}
+
+// ipCmdArg returns the string form of the table to pass to the "ip" command.
+func (rt routeTable) ipCmdArg() string {
+	if rt.num >= 253 {
+		return rt.name
+	}
+	return strconv.Itoa(rt.num)
+}
+
+var routeTableByNumber = map[int]routeTable{}
+
+func newRouteTable(name string, num int) routeTable {
+	rt := routeTable{name, num}
+	routeTableByNumber[num] = rt
+	return rt
+}
+
+func mustRouteTable(num int) routeTable {
+	rt, ok := routeTableByNumber[num]
+	if !ok {
+		panic(fmt.Sprintf("unknown route table %v", num))
+	}
+	return rt
+}
+
+var (
+	mainRouteTable    = newRouteTable("main", 254)
+	defaultRouteTable = newRouteTable("default", 253)
+
+	// tailscaleRouteTable is the routing table number for Tailscale
+	// network routes. See addIPRules for the detailed policy routing
+	// logic that ends up doing lookups within that table.
+	//
+	// NOTE(danderson): We chose 52 because those are the digits above the
+	// letters "TS" on a qwerty keyboard, and 52 is sufficiently unlikely
+	// to be picked by other software.
+	//
+	// NOTE(danderson): You might wonder why we didn't pick some
+	// high table number like 5252, to further avoid the potential
+	// for collisions with other software. Unfortunately,
+	// Busybox's `ip` implementation believes that table numbers
+	// are 8-bit integers, so for maximum compatibility we had to
+	// stay in the 0-255 range even though linux itself supports
+	// larger numbers. (but nowadays we use netlink directly and
+	// aren't affected by the busybox binary's limitations)
+	tailscaleRouteTable = newRouteTable("tailscale", 52)
+)
+
+// ipRules are the policy routing rules that Tailscale uses.
+//
+// NOTE(apenwarr): We leave spaces between each pref number.
+// This is so the sysadmin can override by inserting rules in
+// between if they want.
+//
+// NOTE(apenwarr): This sequence seems complicated, right?
+// If we could simply have a rule that said "match packets that
+// *don't* have this fwmark", then we would only need to add one
+// link to table 52 and we'd be done. Unfortunately, older kernels
+// and 'ip rule' implementations (including busybox), don't support
+// checking for the lack of a fwmark, only the presence. The technique
+// below works even on very old kernels.
+var ipRules = []netlink.Rule{
+	// Packets from us, tagged with our fwmark, first try the kernel's
+	// main routing table.
+	{
+		Priority: 5210,
+		Mark:     tailscaleBypassMarkNum,
+		Table:    mainRouteTable.num,
+	},
+	// ...and then we try the 'default' table, for correctness,
+	// even though it's been empty on every Linux system I've ever seen.
+	{
+		Priority: 5230,
+		Mark:     tailscaleBypassMarkNum,
+		Table:    defaultRouteTable.num,
+	},
+	// If neither of those matched (no default route on this system?)
+	// then packets from us should be aborted rather than falling through
+	// to the tailscale routes, because that would create routing loops.
+	{
+		Priority: 5250,
+		Mark:     tailscaleBypassMarkNum,
+		Table:    0, // unreachable
+	},
+	// If we get to this point, capture all packets and send them
+	// through to the tailscale route table. For apps other than us
+	// (ie. with no fwmark set), this is the first routing table, so
+	// it takes precedence over all the others, ie. VPN routes always
+	// beat non-VPN routes.
+	{
+		Priority: 5270,
+		Table:    tailscaleRouteTable.num,
+	},
+	// If that didn't match, then non-fwmark packets fall through to the
+	// usual rules (pref 32766 and 32767, ie. main and default).
+}
+
 // justAddIPRules adds policy routing rule without deleting any first.
 func (r *linuxRouter) justAddIPRules() error {
 	if !r.ipRuleAvailable {
@@ -661,59 +901,23 @@ func (r *linuxRouter) justAddIPRules() error {
 
 	rg := newRunGroup(nil, r.cmd)
 
-	for _, family := range r.iprouteFamilies() {
-		// NOTE(apenwarr): We leave spaces between each pref number.
-		// This is so the sysadmin can override by inserting rules in
-		// between if they want.
-
-		// NOTE(apenwarr): This sequence seems complicated, right?
-		// If we could simply have a rule that said "match packets that
-		// *don't* have this fwmark", then we would only need to add one
-		// link to table 52 and we'd be done. Unfortunately, older kernels
-		// and 'ip rule' implementations (including busybox), don't support
-		// checking for the lack of a fwmark, only the presence. The technique
-		// below works even on very old kernels.
-
-		// Packets from us, tagged with our fwmark, first try the kernel's
-		// main routing table.
-		rg.Run(
-			"ip", family, "rule", "add",
-			"pref", tailscaleRouteTable+"10",
-			"fwmark", tailscaleBypassMark,
-			"table", mainRouteTable,
-		)
-		// ...and then we try the 'default' table, for correctness,
-		// even though it's been empty on every Linux system I've ever seen.
-		rg.Run(
-			"ip", family, "rule", "add",
-			"pref", tailscaleRouteTable+"30",
-			"fwmark", tailscaleBypassMark,
-			"table", defaultRouteTable,
-		)
-		// If neither of those matched (no default route on this system?)
-		// then packets from us should be aborted rather than falling through
-		// to the tailscale routes, because that would create routing loops.
-		rg.Run(
-			"ip", family, "rule", "add",
-			"pref", tailscaleRouteTable+"50",
-			"fwmark", tailscaleBypassMark,
-			"type", "unreachable",
-		)
-		// If we get to this point, capture all packets and send them
-		// through to the tailscale route table. For apps other than us
-		// (ie. with no fwmark set), this is the first routing table, so
-		// it takes precedence over all the others, ie. VPN routes always
-		// beat non-VPN routes.
-		//
-		// NOTE(apenwarr): tables >255 are not supported in busybox, so we
-		// can't use a table number that aligns with the rule preferences.
-		rg.Run(
-			"ip", family, "rule", "add",
-			"pref", tailscaleRouteTable+"70",
-			"table", tailscaleRouteTable,
-		)
-		// If that didn't match, then non-fwmark packets fall through to the
-		// usual rules (pref 32766 and 32767, ie. main and default).
+	for _, family := range r.addrFamilies() {
+		for _, r := range ipRules {
+			args := []string{
+				"ip", family.dashArg(),
+				"rule", "add",
+				"pref", strconv.Itoa(r.Priority),
+			}
+			if r.Mark != 0 {
+				args = append(args, "fwmark", fmt.Sprintf("0x%x", r.Mark))
+			}
+			if r.Table != 0 {
+				args = append(args, "table", mustRouteTable(r.Table).ipCmdArg())
+			} else {
+				args = append(args, "type", "unreachable")
+			}
+			rg.Run(args...)
+		}
 	}
 
 	return rg.ErrAcc
@@ -745,43 +949,25 @@ func (r *linuxRouter) delIPRules() error {
 	// unknown rules during deletion.
 	rg := newRunGroup([]int{2, 254}, r.cmd)
 
-	for _, family := range r.iprouteFamilies() {
+	for _, family := range r.addrFamilies() {
 		// When deleting rules, we want to be a bit specific (mention which
 		// table we were routing to) but not *too* specific (fwmarks, etc).
 		// That leaves us some flexibility to change these values in later
 		// versions without having ongoing hacks for every possible
 		// combination.
-
-		// Delete old-style tailscale rules
-		// (never released in a stable version, so we can drop this
-		// support eventually).
-		rg.Run(
-			"ip", family, "rule", "del",
-			"pref", "10000",
-			"table", "main",
-		)
-
-		// Delete new-style tailscale rules.
-		rg.Run(
-			"ip", family, "rule", "del",
-			"pref", tailscaleRouteTable+"10",
-			"table", "main",
-		)
-		rg.Run(
-			"ip", family, "rule", "del",
-			"pref", tailscaleRouteTable+"30",
-			"table", "default",
-		)
-		rg.Run(
-			"ip", family, "rule", "del",
-			"pref", tailscaleRouteTable+"50",
-			"type", "unreachable",
-		)
-		rg.Run(
-			"ip", family, "rule", "del",
-			"pref", tailscaleRouteTable+"70",
-			"table", tailscaleRouteTable,
-		)
+		for _, r := range ipRules {
+			args := []string{
+				"ip", family.dashArg(),
+				"rule", "del",
+				"pref", strconv.Itoa(r.Priority),
+			}
+			if r.Table != 0 {
+				args = append(args, "table", mustRouteTable(r.Table).ipCmdArg())
+			} else {
+				args = append(args, "type", "unreachable")
+			}
+			rg.Run(args...)
+		}
 	}
 
 	return rg.ErrAcc
@@ -1277,8 +1463,8 @@ func supportsV6NAT() bool {
 }
 
 func checkIPRuleSupportsV6() error {
-	add := []string{"-6", "rule", "add", "pref", "1234", "fwmark", tailscaleBypassMark, "table", tailscaleRouteTable}
-	del := []string{"-6", "rule", "del", "pref", "1234", "fwmark", tailscaleBypassMark, "table", tailscaleRouteTable}
+	add := []string{"-6", "rule", "add", "pref", "1234", "fwmark", tailscaleBypassMark, "table", tailscaleRouteTable.ipCmdArg()}
+	del := []string{"-6", "rule", "del", "pref", "1234", "fwmark", tailscaleBypassMark, "table", tailscaleRouteTable.ipCmdArg()}
 
 	// First delete the rule unconditionally, and don't check for
 	// errors. This is just cleaning up anything that might be already
@@ -1300,4 +1486,10 @@ func checkIPRuleSupportsV6() error {
 	// Delete again.
 	exec.Command("ip", del...).Run()
 	return nil
+}
+
+func nlAddrOfPrefix(p netaddr.IPPrefix) *netlink.Addr {
+	return &netlink.Addr{
+		IPNet: p.IPNet(),
+	}
 }

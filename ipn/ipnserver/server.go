@@ -101,6 +101,7 @@ type Server struct {
 	// connection (such as on Windows by default).  Even if this
 	// is true, the ForceDaemon pref can override this.
 	resetOnZero bool
+	opts        Options
 
 	bsMu sync.Mutex // lock order: bsMu, then mu
 	bs   *ipn.BackendServer
@@ -171,7 +172,7 @@ func (s *Server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
 		return ci, fmt.Errorf("failed to map connection's pid to a user%s: %w", hint, err)
 	}
 	ci.UserID = uid
-	u, err := s.lookupUserFromID(uid)
+	u, err := lookupUserFromID(s.logf, uid)
 	if err != nil {
 		return ci, fmt.Errorf("failed to look up user from userid: %w", err)
 	}
@@ -179,10 +180,10 @@ func (s *Server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
 	return ci, nil
 }
 
-func (s *Server) lookupUserFromID(uid string) (*user.User, error) {
+func lookupUserFromID(logf logger.Logf, uid string) (*user.User, error) {
 	u, err := user.LookupId(uid)
 	if err != nil && runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(0x534)) {
-		s.logf("[warning] issue 869: os/user.LookupId failed; ignoring")
+		logf("[warning] issue 869: os/user.LookupId failed; ignoring")
 		// Work around https://github.com/tailscale/tailscale/issues/869 for
 		// now. We don't strictly need the username. It's just a nice-to-have.
 		// So make up a *user.User if their machine is broken in this way.
@@ -617,11 +618,8 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 		return fmt.Errorf("safesocket.Listen: %v", err)
 	}
 
-	server := &Server{
-		backendLogID: logid,
-		logf:         logf,
-		resetOnZero:  !opts.SurviveDisconnects,
-	}
+	var serverMu sync.Mutex
+	var serverOrNil *Server
 
 	// When the context is closed or when we return, whichever is first, close our listener
 	// and all open connections.
@@ -630,11 +628,16 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 		case <-ctx.Done():
 		case <-runDone:
 		}
-		server.stopAll()
+		serverMu.Lock()
+		if s := serverOrNil; s != nil {
+			s.stopAll()
+		}
+		serverMu.Unlock()
 		listen.Close()
 	}()
 	logf("Listening on %v", listen.Addr())
 
+	var serverModeUser *user.User
 	var store ipn.StateStore
 	if opts.StatePath != "" {
 		const kubePrefix = "kube:"
@@ -669,12 +672,12 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 			key := string(autoStartKey)
 			if strings.HasPrefix(key, "user-") {
 				uid := strings.TrimPrefix(key, "user-")
-				u, err := server.lookupUserFromID(uid)
+				u, err := lookupUserFromID(logf, uid)
 				if err != nil {
 					logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
 				} else {
 					logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
-					server.serverModeUser = u
+					serverModeUser = u
 				}
 				opts.AutostartStateKey = ipn.StateKey(key)
 			}
@@ -716,12 +719,31 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 			return err
 		}
 	}
+	if unservedConn != nil {
+		listen = &listenerWithReadyConn{
+			Listener: listen,
+			c:        unservedConn,
+		}
+	}
 
+	server, err := New(logf, logid, store, eng, serverModeUser, opts)
+	if err != nil {
+		return err
+	}
+	serverMu.Lock()
+	serverOrNil = server
+	serverMu.Unlock()
+	return server.Serve(ctx, listen)
+}
+
+// New returns a new Server.
+//
+// The opts.StatePath option is ignored; it's only used by Run.
+func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, serverModeUser *user.User, opts Options) (*Server, error) {
 	b, err := ipnlocal.NewLocalBackend(logf, logid, store, eng)
 	if err != nil {
-		return fmt.Errorf("NewLocalBackend: %v", err)
+		return nil, fmt.Errorf("NewLocalBackend: %v", err)
 	}
-	defer b.Shutdown()
 	b.SetDecompressor(func() (controlclient.Decompressor, error) {
 		return smallzstd.NewDecoder(nil)
 	})
@@ -732,38 +754,51 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 		})
 	}
 
-	server.b = b
+	server := &Server{
+		b:              b,
+		backendLogID:   logid,
+		logf:           logf,
+		resetOnZero:    !opts.SurviveDisconnects,
+		serverModeUser: serverModeUser,
+		opts:           opts,
+	}
 	server.bs = ipn.NewBackendServer(logf, b, server.writeToClients)
+	return server, nil
+}
 
-	if opts.AutostartStateKey != "" {
-		server.bs.GotCommand(context.TODO(), &ipn.Command{
+// Serve accepts connections from ln forever.
+//
+// The context is only used to suppress errors
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	defer s.b.Shutdown()
+	if s.opts.AutostartStateKey != "" {
+		s.bs.GotCommand(ctx, &ipn.Command{
 			Version: version.Long,
 			Start: &ipn.StartArgs{
-				Opts: ipn.Options{StateKey: opts.AutostartStateKey},
+				Opts: ipn.Options{StateKey: s.opts.AutostartStateKey},
 			},
 		})
 	}
 
 	systemd.Ready()
-	for i := 1; ctx.Err() == nil; i++ {
-		var c net.Conn
-		var err error
-		if unservedConn != nil {
-			c = unservedConn
-			unservedConn = nil
-		} else {
-			c, err = listen.Accept()
+	bo := backoff.NewBackoff("ipnserver", s.logf, 30*time.Second)
+	var connNum int
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil {
-				logf("ipnserver: Accept: %v", err)
-				bo.BackOff(ctx, err)
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
+			s.logf("ipnserver: Accept: %v", err)
+			bo.BackOff(ctx, err)
 			continue
 		}
-		go server.serveConn(ctx, c, logger.WithPrefix(logf, fmt.Sprintf("ipnserver: conn%d: ", i)))
+		connNum++
+		go s.serveConn(ctx, c, logger.WithPrefix(s.logf, fmt.Sprintf("ipnserver: conn%d: ", connNum)))
 	}
-	return ctx.Err()
 }
 
 // BabysitProc runs the current executable as a child process with the
@@ -1018,4 +1053,24 @@ func marshalNotify(n ipn.Notify, logf logger.Logf) (b []byte, ok bool) {
 		logf("[unexpected] zero byte in BackendServer.send notify message: %q", b)
 	}
 	return b, true
+}
+
+// listenerWithReadyConn is a net.Listener wrapper that has
+// one net.Conn ready to be accepted already.
+type listenerWithReadyConn struct {
+	net.Listener
+
+	mu sync.Mutex
+	c  net.Conn // if non-nil, ready to be Accepted
+}
+
+func (ln *listenerWithReadyConn) Accept() (net.Conn, error) {
+	ln.mu.Lock()
+	c := ln.c
+	ln.c = nil
+	ln.mu.Unlock()
+	if c != nil {
+		return c, nil
+	}
+	return ln.Listener.Accept()
 }
