@@ -78,21 +78,24 @@ func (u StableNodeID) IsZero() bool {
 	return u == ""
 }
 
-// NodeKey is the curve25519 public key for a node.
-type NodeKey [32]byte
-
-// NodeKeyFromNodePublic returns k converted to a NodeKey.
+// NodeKey is the WireGuard public key for a node.
 //
-// Deprecated: exists only as a compatibility bridge while NodeKey
-// gets removed from the codebase. Do not introduce new uses that
-// aren't related to #3206.
-func NodeKeyFromNodePublic(k key.NodePublic) NodeKey {
-	return k.Raw32()
-}
+// Deprecated: prefer to use key.NodePublic instead. If you must have
+// a NodeKey, use NodePublic.AsNodeKey.
+type NodeKey = key.NodeKey
 
 // DiscoKey is the curve25519 public key for path discovery key.
 // It's never written to disk or reused between network start-ups.
 type DiscoKey [32]byte
+
+// DiscoKeyFromNodePublic returns k converted to a DiscoKey.
+//
+// Deprecated: exists only as a compatibility bridge while DiscoKey
+// gets removed from the codebase. Do not introduce new uses that
+// aren't related to #3206.
+func DiscoKeyFromDiscoPublic(k key.DiscoPublic) DiscoKey {
+	return k.Raw32()
+}
 
 // User is an IPN user.
 //
@@ -1136,32 +1139,21 @@ func keyMarshalText(prefix string, k [32]byte) []byte {
 	return appendKey(nil, prefix, k)
 }
 
-func keyUnmarshalText(dst []byte, prefix string, text []byte) error {
-	if len(text) < len(prefix) || string(text[:len(prefix)]) != prefix {
-		return fmt.Errorf("UnmarshalText: missing %q prefix", prefix)
+func (k DiscoKey) String() string { return fmt.Sprintf("discokey:%x", k[:]) }
+func (k DiscoKey) MarshalText() ([]byte, error) {
+	dk := key.DiscoPublicFromRaw32(mem.B(k[:]))
+	return dk.MarshalText()
+}
+func (k *DiscoKey) UnmarshalText(text []byte) error {
+	var dk key.DiscoPublic
+	if err := dk.UnmarshalText(text); err != nil {
+		return err
 	}
-	pub, err := key.NewPublicFromHexMem(mem.B(text[len(prefix):]))
-	if err != nil {
-		return fmt.Errorf("UnmarshalText: after %q: %v", prefix, err)
-	}
-	copy(dst[:], pub[:])
+	dk.AppendTo(k[:0])
 	return nil
 }
-
-func (k NodeKey) ShortString() string { return (key.Public(k)).ShortString() }
-
-func (k NodeKey) String() string                   { return fmt.Sprintf("nodekey:%x", k[:]) }
-func (k NodeKey) MarshalText() ([]byte, error)     { return keyMarshalText("nodekey:", k), nil }
-func (k *NodeKey) UnmarshalText(text []byte) error { return keyUnmarshalText(k[:], "nodekey:", text) }
-
-// IsZero reports whether k is the zero value.
-func (k NodeKey) IsZero() bool { return k == NodeKey{} }
-
-func (k DiscoKey) String() string                   { return fmt.Sprintf("discokey:%x", k[:]) }
-func (k DiscoKey) MarshalText() ([]byte, error)     { return keyMarshalText("discokey:", k), nil }
-func (k *DiscoKey) UnmarshalText(text []byte) error { return keyUnmarshalText(k[:], "discokey:", text) }
-func (k DiscoKey) ShortString() string              { return fmt.Sprintf("d:%x", k[:8]) }
-func (k DiscoKey) AppendTo(b []byte) []byte         { return appendKey(b, "discokey:", k) }
+func (k DiscoKey) ShortString() string      { return fmt.Sprintf("d:%x", k[:8]) }
+func (k DiscoKey) AppendTo(b []byte) []byte { return appendKey(b, "discokey:", k) }
 
 // IsZero reports whether k is the zero value.
 func (k DiscoKey) IsZero() bool { return k == DiscoKey{} }

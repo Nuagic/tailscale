@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"go4.org/mem"
-	"golang.org/x/crypto/nacl/box"
 	"golang.zx2c4.com/wireguard/conn"
 	"inet.af/netaddr"
 	"tailscale.com/control/controlclient"
@@ -98,14 +97,14 @@ type peerMap struct {
 
 	// nodesOfDisco are contains the set of nodes that are using a
 	// DiscoKey. Usually those sets will be just one node.
-	nodesOfDisco map[tailcfg.DiscoKey]map[tailcfg.NodeKey]bool
+	nodesOfDisco map[key.DiscoPublic]map[tailcfg.NodeKey]bool
 }
 
 func newPeerMap() peerMap {
 	return peerMap{
 		byNodeKey:    map[tailcfg.NodeKey]*peerInfo{},
 		byIPPort:     map[netaddr.IPPort]*peerInfo{},
-		nodesOfDisco: map[tailcfg.DiscoKey]map[tailcfg.NodeKey]bool{},
+		nodesOfDisco: map[key.DiscoPublic]map[tailcfg.NodeKey]bool{},
 	}
 }
 
@@ -116,7 +115,7 @@ func (m *peerMap) nodeCount() int {
 
 // anyEndpointForDiscoKey reports whether there exists any
 // peers in the netmap with dk as their DiscoKey.
-func (m *peerMap) anyEndpointForDiscoKey(dk tailcfg.DiscoKey) bool {
+func (m *peerMap) anyEndpointForDiscoKey(dk key.DiscoPublic) bool {
 	return len(m.nodesOfDisco[dk]) > 0
 }
 
@@ -150,7 +149,7 @@ func (m *peerMap) forEachEndpoint(f func(ep *endpoint)) {
 
 // forEachEndpointWithDiscoKey invokes f on every endpoint in m
 // that has the provided DiscoKey.
-func (m *peerMap) forEachEndpointWithDiscoKey(dk tailcfg.DiscoKey, f func(ep *endpoint)) {
+func (m *peerMap) forEachEndpointWithDiscoKey(dk key.DiscoPublic, f func(ep *endpoint)) {
 	for nk := range m.nodesOfDisco[dk] {
 		pi, ok := m.byNodeKey[nk]
 		if !ok {
@@ -351,20 +350,20 @@ type Conn struct {
 	// WireGuard. These are not used to filter inbound or outbound
 	// traffic at all, but only to track what state can be cleaned up
 	// in other maps below that are keyed by peer public key.
-	peerSet map[key.Public]struct{}
+	peerSet map[key.NodePublic]struct{}
 
 	// discoPrivate is the private naclbox key used for active
 	// discovery traffic. It's created once near (but not during)
 	// construction.
-	discoPrivate key.Private
-	discoPublic  tailcfg.DiscoKey // public of discoPrivate
-	discoShort   string           // ShortString of discoPublic (to save logging work later)
+	discoPrivate key.DiscoPrivate
+	discoPublic  key.DiscoPublic // public of discoPrivate
+	discoShort   string          // ShortString of discoPublic (to save logging work later)
 	// nodeOfDisco tracks the networkmap Node entity for each peer
 	// discovery key.
 	peerMap peerMap
 
 	// discoInfo is the state for an active DiscoKey.
-	discoInfo map[tailcfg.DiscoKey]*discoInfo
+	discoInfo map[key.DiscoPublic]*discoInfo
 
 	// netInfoFunc is a callback that provides a tailcfg.NetInfo when
 	// discovered network conditions change.
@@ -383,7 +382,7 @@ type Conn struct {
 
 	derpMap     *tailcfg.DERPMap // nil (or zero regions/nodes) means DERP is disabled
 	netMap      *netmap.NetworkMap
-	privateKey  key.Private        // WireGuard private key for this node
+	privateKey  key.NodePrivate    // WireGuard private key for this node
 	everHadKey  bool               // whether we ever had a non-zero private key
 	myDerp      int                // nearest DERP region ID; 0 means none/unknown
 	derpStarted chan struct{}      // closed on first connection to DERP; for tests & cleaner Close
@@ -397,11 +396,11 @@ type Conn struct {
 	// home connection, or what was once our home), then we
 	// remember that route here to optimistically use instead of
 	// creating a new DERP connection back to their home.
-	derpRoute map[key.Public]derpRoute
+	derpRoute map[key.NodePublic]derpRoute
 
 	// peerLastDerp tracks which DERP node we last used to speak with a
 	// peer. It's only used to quiet logging, so we only log on change.
-	peerLastDerp map[key.Public]int
+	peerLastDerp map[key.NodePublic]int
 }
 
 // derpRoute is a route entry for a public key, saying that a certain
@@ -414,7 +413,7 @@ type derpRoute struct {
 }
 
 // removeDerpPeerRoute removes a DERP route entry previously added by addDerpPeerRoute.
-func (c *Conn) removeDerpPeerRoute(peer key.Public, derpID int, dc *derphttp.Client) {
+func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, derpID int, dc *derphttp.Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r2 := derpRoute{derpID, dc}
@@ -426,11 +425,11 @@ func (c *Conn) removeDerpPeerRoute(peer key.Public, derpID int, dc *derphttp.Cli
 // addDerpPeerRoute adds a DERP route entry, noting that peer was seen
 // on DERP node derpID, at least on the connection identified by dc.
 // See issue 150 for details.
-func (c *Conn) addDerpPeerRoute(peer key.Public, derpID int, dc *derphttp.Client) {
+func (c *Conn) addDerpPeerRoute(peer key.NodePublic, derpID int, dc *derphttp.Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.derpRoute == nil {
-		c.derpRoute = make(map[key.Public]derpRoute)
+		c.derpRoute = make(map[key.NodePublic]derpRoute)
 	}
 	r := derpRoute{derpID, dc}
 	c.derpRoute[peer] = r
@@ -527,9 +526,9 @@ func newConn() *Conn {
 	c := &Conn{
 		derpRecvCh:   make(chan derpReadResult),
 		derpStarted:  make(chan struct{}),
-		peerLastDerp: make(map[key.Public]int),
+		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
-		discoInfo:    make(map[tailcfg.DiscoKey]*discoInfo),
+		discoInfo:    make(map[key.DiscoPublic]*discoInfo),
 	}
 	c.bind = &connBind{Conn: c, closed: true}
 	c.muCond = sync.NewCond(&c.mu)
@@ -931,13 +930,13 @@ func (c *Conn) derpRegionCodeLocked(regionID int) string {
 }
 
 // DiscoPublicKey returns the discovery public key.
-func (c *Conn) DiscoPublicKey() tailcfg.DiscoKey {
+func (c *Conn) DiscoPublicKey() key.DiscoPublic {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.discoPrivate.IsZero() {
-		priv := key.NewPrivate()
+		priv := key.NewDisco()
 		c.discoPrivate = priv
-		c.discoPublic = tailcfg.DiscoKey(priv.Public())
+		c.discoPublic = priv.Public()
 		c.discoShort = c.discoPublic.ShortString()
 		c.logf("magicsock: disco key = %v", c.discoShort)
 	}
@@ -1006,7 +1005,7 @@ func (c *Conn) goDerpConnect(node int) {
 	if node == 0 {
 		return
 	}
-	go c.derpWriteChanOfAddr(netaddr.IPPortFrom(derpMagicIPAddr, uint16(node)), key.Public{})
+	go c.derpWriteChanOfAddr(netaddr.IPPortFrom(derpMagicIPAddr, uint16(node)), key.NodePublic{})
 }
 
 // determineEndpoints returns the machine's endpoint addresses. It
@@ -1233,7 +1232,7 @@ func (c *Conn) sendUDPStd(addr *net.UDPAddr, b []byte) (sent bool, err error) {
 // An example of when they might be different: sending to an
 // IPv6 address when the local machine doesn't have IPv6 support
 // returns (false, nil); it's not an error, but nothing was sent.
-func (c *Conn) sendAddr(addr netaddr.IPPort, pubKey key.Public, b []byte) (sent bool, err error) {
+func (c *Conn) sendAddr(addr netaddr.IPPort, pubKey key.NodePublic, b []byte) (sent bool, err error) {
 	if addr.IP() != derpMagicIPAddr {
 		return c.sendUDP(addr, b)
 	}
@@ -1275,7 +1274,7 @@ const bufferedDerpWritesBeforeDrop = 32
 //
 // If peer is non-zero, it can be used to find an active reverse
 // path, without using addr.
-func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- derpWriteRequest {
+func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.NodePublic) chan<- derpWriteRequest {
 	if addr.IP() != derpMagicIPAddr {
 		return nil
 	}
@@ -1324,7 +1323,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 
 	why := "home-keep-alive"
 	if !peer.IsZero() {
-		why = peerShort(peer)
+		why = peer.ShortString()
 	}
 	c.logf("magicsock: adding connection to derp-%v for %v", regionID, why)
 
@@ -1340,7 +1339,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 
 	// Note that derphttp.NewRegionClient does not dial the server
 	// so it is safe to do under the mu lock.
-	dc := derphttp.NewRegionClient(key.NodePrivateFromRaw32(mem.B(c.privateKey[:])), c.logf, func() *tailcfg.DERPRegion {
+	dc := derphttp.NewRegionClient(c.privateKey, c.logf, func() *tailcfg.DERPRegion {
 		if c.connCtx.Err() != nil {
 			// If we're closing, don't try to acquire the lock.
 			// We might already be in Conn.Close and the Lock would deadlock.
@@ -1407,7 +1406,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 // If there's any change, it logs.
 //
 // c.mu must be held.
-func (c *Conn) setPeerLastDerpLocked(peer key.Public, regionID, homeID int) {
+func (c *Conn) setPeerLastDerpLocked(peer key.NodePublic, regionID, homeID int) {
 	if peer.IsZero() {
 		return
 	}
@@ -1429,9 +1428,9 @@ func (c *Conn) setPeerLastDerpLocked(peer key.Public, regionID, homeID int) {
 		newDesc = "alt"
 	}
 	if old == 0 {
-		c.logf("[v1] magicsock: derp route for %s set to derp-%d (%s)", peerShort(peer), regionID, newDesc)
+		c.logf("[v1] magicsock: derp route for %s set to derp-%d (%s)", peer.ShortString(), regionID, newDesc)
 	} else {
-		c.logf("[v1] magicsock: derp route for %s changed from derp-%d => derp-%d (%s)", peerShort(peer), old, regionID, newDesc)
+		c.logf("[v1] magicsock: derp route for %s changed from derp-%d => derp-%d (%s)", peer.ShortString(), old, regionID, newDesc)
 	}
 }
 
@@ -1445,7 +1444,7 @@ func (c *Conn) setPeerLastDerpLocked(peer key.Public, regionID, homeID int) {
 type derpReadResult struct {
 	regionID int
 	n        int // length of data received
-	src      key.Public
+	src      key.NodePublic
 	// copyBuf is called to copy the data to dst.  It returns how
 	// much data was copied, which will be n if dst is large
 	// enough. copyBuf can only be called once.
@@ -1481,7 +1480,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 
 	// peerPresent is the set of senders we know are present on this
 	// connection, based on messages we've received from the server.
-	peerPresent := map[key.Public]bool{}
+	peerPresent := map[key.NodePublic]bool{}
 	bo := backoff.NewBackoff(fmt.Sprintf("derp-%d", regionID), c.logf, 5*time.Second)
 	var lastPacketTime time.Time
 
@@ -1539,7 +1538,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 		case derp.ReceivedPacket:
 			pkt = m
 			res.n = len(m.Data)
-			res.src = m.Source.AsPublic()
+			res.src = m.Source
 			if logDerpVerbose {
 				c.logf("magicsock: got derp-%v packet: %q", regionID, m.Data)
 			}
@@ -1582,7 +1581,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 
 type derpWriteRequest struct {
 	addr   netaddr.IPPort
-	pubKey key.Public
+	pubKey key.NodePublic
 	b      []byte // copied; ownership passed to receiver
 }
 
@@ -1601,7 +1600,7 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
-			err := dc.Send(key.NodePublicFromRaw32(mem.B(wr.pubKey[:])), wr.b)
+			err := dc.Send(wr.pubKey, wr.b)
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 			}
@@ -1711,13 +1710,13 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 	}
 
 	ipp := netaddr.IPPortFrom(derpMagicIPAddr, uint16(regionID))
-	if c.handleDiscoMessage(b[:n], ipp, tailcfg.NodeKey(dm.src)) {
+	if c.handleDiscoMessage(b[:n], ipp, dm.src.AsNodeKey()) {
 		return 0, nil
 	}
 
 	var ok bool
 	c.mu.Lock()
-	ep, ok = c.peerMap.endpointForNodeKey(tailcfg.NodeKey(dm.src))
+	ep, ok = c.peerMap.endpointForNodeKey(dm.src.AsNodeKey())
 	c.mu.Unlock()
 	if !ok {
 		// We don't know anything about this node key, nothing to
@@ -1747,7 +1746,7 @@ const (
 //
 // The dstKey should only be non-zero if the dstDisco key
 // unambiguously maps to exactly one peer.
-func (c *Conn) sendDiscoMessage(dst netaddr.IPPort, dstKey tailcfg.NodeKey, dstDisco tailcfg.DiscoKey, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
+func (c *Conn) sendDiscoMessage(dst netaddr.IPPort, dstKey tailcfg.NodeKey, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -1759,13 +1758,13 @@ func (c *Conn) sendDiscoMessage(dst netaddr.IPPort, dstKey tailcfg.NodeKey, dstD
 	}
 	pkt := make([]byte, 0, 512) // TODO: size it correctly? pool? if it matters.
 	pkt = append(pkt, disco.Magic...)
-	pkt = append(pkt, c.discoPublic[:]...)
-	pkt = append(pkt, nonce[:]...)
+	pkt = c.discoPublic.AppendTo(pkt)
 	di := c.discoInfoLocked(dstDisco)
 	c.mu.Unlock()
 
-	pkt = box.SealAfterPrecomputation(pkt, m.AppendMarshal(nil), &nonce, di.sharedKey)
-	sent, err = c.sendAddr(dst, key.Public(dstKey), pkt)
+	box := di.sharedKey.Seal(m.AppendMarshal(nil))
+	pkt = append(pkt, box...)
+	sent, err = c.sendAddr(dst, key.NodePublicFromRaw32(mem.B(dstKey[:])), pkt)
 	if sent {
 		if logLevel == discoLog || (logLevel == discoVerboseLog && debugDisco) {
 			node := "?"
@@ -1799,7 +1798,7 @@ func (c *Conn) sendDiscoMessage(dst netaddr.IPPort, dstKey tailcfg.NodeKey, dstD
 // it was received from at the DERP layer. derpNodeSrc is zero when received
 // over UDP.
 func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort, derpNodeSrc tailcfg.NodeKey) (isDiscoMsg bool) {
-	const headerLen = len(disco.Magic) + len(tailcfg.DiscoKey{}) + disco.NonceLen
+	const headerLen = len(disco.Magic) + key.DiscoPublicRawLen
 	if len(msg) < headerLen || string(msg[:len(disco.Magic)]) != disco.Magic {
 		return false
 	}
@@ -1810,8 +1809,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort, derpNodeSrc ta
 	// Use naked returns for all following paths.
 	isDiscoMsg = true
 
-	var sender tailcfg.DiscoKey
-	copy(sender[:], msg[len(disco.Magic):])
+	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):headerLen]))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1848,10 +1846,8 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort, derpNodeSrc ta
 
 	di := c.discoInfoLocked(sender)
 
-	var nonce [disco.NonceLen]byte
-	copy(nonce[:], msg[len(disco.Magic)+len(key.Public{}):])
 	sealedBox := msg[headerLen:]
-	payload, ok := box.OpenAfterPrecomputation(nil, sealedBox, &nonce, di.sharedKey)
+	payload, ok := di.sharedKey.Open(sealedBox)
 	if !ok {
 		// This might be have been intended for a previous
 		// disco key.  When we restart we get a new disco key
@@ -1931,7 +1927,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort, derpNodeSrc ta
 // derpNodeSrc is non-zero if the disco ping arrived via DERP.
 //
 // c.mu must be held.
-func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk tailcfg.DiscoKey, derpNodeSrc tailcfg.NodeKey) (nk tailcfg.NodeKey, ok bool) {
+func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic, derpNodeSrc tailcfg.NodeKey) (nk tailcfg.NodeKey, ok bool) {
 	if !derpNodeSrc.IsZero() {
 		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok && ep.discoKey == dk {
 			return derpNodeSrc, true
@@ -1940,8 +1936,8 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk tailcfg.DiscoKe
 
 	// Pings after 1.16.0 contains its node source. See if it maps back.
 	if !dm.NodeKey.IsZero() {
-		if ep, ok := c.peerMap.endpointForNodeKey(dm.NodeKey); ok && ep.discoKey == dk {
-			return dm.NodeKey, true
+		if ep, ok := c.peerMap.endpointForNodeKey(dm.NodeKey.AsNodeKey()); ok && ep.discoKey == dk {
+			return dm.NodeKey.AsNodeKey(), true
 		}
 	}
 
@@ -2070,15 +2066,14 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netaddr.IPPort, de *endpoint) {
 // discoInfoLocked returns the previous or new discoInfo for k.
 //
 // c.mu must be held.
-func (c *Conn) discoInfoLocked(k tailcfg.DiscoKey) *discoInfo {
+func (c *Conn) discoInfoLocked(k key.DiscoPublic) *discoInfo {
 	di, ok := c.discoInfo[k]
 	if !ok {
 		di = &discoInfo{
 			discoKey:   k,
 			discoShort: k.ShortString(),
-			sharedKey:  new([32]byte),
+			sharedKey:  c.discoPrivate.Shared(k),
 		}
-		box.Precompute(di.sharedKey, key.Public(k).B32(), c.discoPrivate.B32())
 		c.discoInfo[k] = di
 	}
 	return di
@@ -2127,8 +2122,8 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	oldKey, newKey := c.privateKey, privateKey.AsPrivate()
-	if newKey == oldKey {
+	oldKey, newKey := c.privateKey, privateKey
+	if newKey.Equal(oldKey) {
 		return nil
 	}
 	c.privateKey = newKey
@@ -2137,7 +2132,7 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 	if newKey.IsZero() {
 		c.publicKeyAtomic.Store(tailcfg.NodeKey{})
 	} else {
-		c.publicKeyAtomic.Store(tailcfg.NodeKey(newKey.Public()))
+		c.publicKeyAtomic.Store(newKey.Public().AsNodeKey())
 	}
 
 	if oldKey.IsZero() {
@@ -2173,14 +2168,14 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 // then removes any state for old peers.
 //
 // The caller passes ownership of newPeers map to UpdatePeers.
-func (c *Conn) UpdatePeers(newPeers map[key.Public]struct{}) {
+func (c *Conn) UpdatePeers(newPeers map[key.NodePublic]struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	oldPeers := c.peerSet
 	c.peerSet = newPeers
 
-	// Clean up any key.Public-keyed maps for peers that no longer
+	// Clean up any key.NodePublic-keyed maps for peers that no longer
 	// exist.
 	for peer := range oldPeers {
 		if _, ok := newPeers[peer]; !ok {
@@ -2274,7 +2269,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			endpointState: map[netaddr.IPPort]*endpointState{},
 		}
 		if !n.DiscoKey.IsZero() {
-			ep.discoKey = n.DiscoKey
+			ep.discoKey = key.DiscoPublicFromRaw32(mem.B(n.DiscoKey[:]))
 			ep.discoShort = n.DiscoKey.ShortString()
 		}
 		ep.wgEndpoint = key.NodePublicFromRaw32(mem.B(n.Key[:])).UntypedHexString()
@@ -2823,7 +2818,7 @@ func (c *Conn) ParseEndpoint(nodeKeyStr string) (conn.Endpoint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("magicsock: ParseEndpoint: parse failed on %q: %w", nodeKeyStr, err)
 	}
-	pk := tailcfg.NodeKeyFromNodePublic(k)
+	pk := k.AsNodeKey()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3018,10 +3013,6 @@ func simpleDur(d time.Duration) time.Duration {
 	return d.Round(time.Minute)
 }
 
-func peerShort(k key.Public) string {
-	return key.NodePublicFromRaw32(mem.B(k[:])).ShortString()
-}
-
 func sbPrintAddr(sb *strings.Builder, a netaddr.IPPort) {
 	is6 := a.IP().Is6()
 	if is6 {
@@ -3081,7 +3072,11 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	}
 
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
-		ss.PublicKey = c.privateKey.Public()
+		if !c.privateKey.IsZero() {
+			ss.PublicKey = c.privateKey.Public()
+		} else {
+			ss.PublicKey = key.NodePublic{}
+		}
 		ss.Addrs = make([]string, 0, len(c.lastEndpoints))
 		for _, ep := range c.lastEndpoints {
 			ss.Addrs = append(ss.Addrs, ep.Addr.String())
@@ -3113,7 +3108,7 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 		ps := &ipnstate.PeerStatus{InMagicSock: true}
 		//ps.Addrs = append(ps.Addrs, n.Endpoints...)
 		ep.populatePeerStatus(ps)
-		sb.AddPeer(key.Public(ep.publicKey), ps)
+		sb.AddPeer(key.NodePublicFromRaw32(mem.B(ep.publicKey[:])), ps)
 	})
 
 	c.foreachActiveDerpSortedLocked(func(node int, ad activeDerp) {
@@ -3146,8 +3141,8 @@ type endpoint struct {
 	// mu protects all following fields.
 	mu sync.Mutex // Lock ordering: Conn.mu, then endpoint.mu
 
-	discoKey   tailcfg.DiscoKey // for discovery messages. IsZero() if peer can't disco.
-	discoShort string           // ShortString of discoKey. Empty if peer can't disco.
+	discoKey   key.DiscoPublic // for discovery messages. IsZero() if peer can't disco.
+	discoShort string          // ShortString of discoKey. Empty if peer can't disco.
 
 	heartBeatTimer *time.Timer    // nil when idle
 	lastSend       mono.Time      // last time there was outgoing packets sent to this peer (from wireguard-go)
@@ -3463,10 +3458,10 @@ func (de *endpoint) send(b []byte) error {
 	}
 	var err error
 	if !udpAddr.IsZero() {
-		_, err = de.c.sendAddr(udpAddr, key.Public(de.publicKey), b)
+		_, err = de.c.sendAddr(udpAddr, key.NodePublicFromRaw32(mem.B(de.publicKey[:])), b)
 	}
 	if !derpAddr.IsZero() {
-		if ok, _ := de.c.sendAddr(derpAddr, key.Public(de.publicKey), b); ok && err != nil {
+		if ok, _ := de.c.sendAddr(derpAddr, key.NodePublicFromRaw32(mem.B(de.publicKey[:])), b); ok && err != nil {
 			// UDP failed but DERP worked, so good enough:
 			return nil
 		}
@@ -3512,7 +3507,7 @@ func (de *endpoint) sendDiscoPing(ep netaddr.IPPort, txid stun.TxID, logLevel di
 	selfPubKey, _ := de.c.publicKeyAtomic.Load().(tailcfg.NodeKey)
 	sent, _ := de.sendDiscoMessage(ep, &disco.Ping{
 		TxID:    [12]byte(txid),
-		NodeKey: selfPubKey,
+		NodeKey: selfPubKey.AsNodePublic(),
 	}, logLevel)
 	if !sent {
 		de.forgetPing(txid)
@@ -3615,9 +3610,10 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	if de.discoKey != n.DiscoKey {
+	tnk := key.DiscoPublicFromRaw32(mem.B(n.DiscoKey[:]))
+	if de.discoKey != tnk {
 		de.c.logf("[v1] magicsock: disco: node %s changed from discokey %s to %s", de.publicKey.ShortString(), de.discoKey, n.DiscoKey)
-		de.discoKey = n.DiscoKey
+		de.discoKey = tnk
 		de.discoShort = de.discoKey.ShortString()
 		de.resetLocked()
 	}
@@ -3915,7 +3911,7 @@ func (de *endpoint) stopAndReset() {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	de.c.logf("[v1] magicsock: doing cleanup for discovery key %x", de.discoKey[:])
+	de.c.logf("[v1] magicsock: doing cleanup for discovery key %s", de.discoKey.ShortString())
 
 	de.resetLocked()
 	if de.heartBeatTimer != nil {
@@ -3968,17 +3964,17 @@ type discoInfo struct {
 	// discoKey is the same as the Conn.discoInfo map key,
 	// just so you can pass around a *discoInfo alone.
 	// Not modifed once initiazed.
-	discoKey tailcfg.DiscoKey
+	discoKey key.DiscoPublic
 
 	// discoShort is discoKey.ShortString().
 	// Not modifed once initiazed;
 	discoShort string
 
-	// sharedKey is the precomputed nacl/box key for
-	// communication with the peer that has the DiscoKey
-	// used to look up this *discoInfo in Conn.discoInfo.
+	// sharedKey is the precomputed key for communication with the
+	// peer that has the DiscoKey used to look up this *discoInfo in
+	// Conn.discoInfo.
 	// Not modifed once initialized.
-	sharedKey *[32]byte
+	sharedKey key.DiscoShared
 
 	// Mutable fields follow, owned by Conn.mu:
 

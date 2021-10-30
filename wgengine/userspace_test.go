@@ -45,7 +45,7 @@ func TestNoteReceiveActivity(t *testing.T) {
 	}
 	ra := e.recvActivityAt
 
-	nk := tailcfg.NodeKey(key.NewPrivate().Public())
+	nk := key.NewNode().Public().AsNodeKey()
 
 	// Activity on an untracked key should do nothing.
 	e.noteRecvActivity(nk)
@@ -213,11 +213,11 @@ func nkFromHex(hex string) tailcfg.NodeKey {
 	if len(hex) != 64 {
 		panic(fmt.Sprintf("%q is len %d; want 64", hex, len(hex)))
 	}
-	k, err := key.NewPublicFromHexMem(mem.S(hex[:64]))
+	k, err := key.ParseNodePublicUntyped(mem.S(hex[:64]))
 	if err != nil {
 		panic(fmt.Sprintf("%q is not hex: %v", hex, err))
 	}
-	return tailcfg.NodeKey(k)
+	return k.AsNodeKey()
 }
 
 // an experiment to see if genLocalAddrFunc was worth it. As of Go

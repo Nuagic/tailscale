@@ -264,13 +264,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Key: NodeKeyFromNodePublic(n1)},
-			&Node{Key: NodeKeyFromNodePublic(key.NewNode().Public())},
+			&Node{Key: n1.AsNodeKey()},
+			&Node{Key: key.NewNode().Public().AsNodeKey()},
 			false,
 		},
 		{
-			&Node{Key: NodeKeyFromNodePublic(n1)},
-			&Node{Key: NodeKeyFromNodePublic(n1)},
+			&Node{Key: n1.AsNodeKey()},
+			&Node{Key: n1.AsNodeKey()},
 			true,
 		},
 		{
@@ -405,14 +405,6 @@ func TestNetInfoFields(t *testing.T) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, handled)
 	}
-}
-
-func TestNodeKeyMarshal(t *testing.T) {
-	var k1, k2 NodeKey
-	for i := range k1 {
-		k1[i] = byte(i)
-	}
-	testKey(t, "nodekey:", k1, &k2)
 }
 
 func TestDiscoKeyMarshal(t *testing.T) {

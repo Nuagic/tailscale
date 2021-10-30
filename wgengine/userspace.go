@@ -331,7 +331,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	closePool.add(e.magicConn)
 	e.magicConn.SetNetworkUp(e.linkMon.InterfaceState().AnyInterfaceUp())
 
-	tsTUNDev.SetDiscoKey(e.magicConn.DiscoPublicKey())
+	tsTUNDev.SetDiscoKey(tailcfg.DiscoKeyFromDiscoPublic(e.magicConn.DiscoPublicKey()))
 
 	if conf.RespondToPing {
 		e.tundev.PostFilterIn = echoRespondToAll
@@ -648,7 +648,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[tailcfg.
 	for i := range full.Peers {
 		p := &full.Peers[i]
 		nk := p.PublicKey
-		tnk := tailcfg.NodeKeyFromNodePublic(nk)
+		tnk := nk.AsNodeKey()
 		if !isTrimmablePeer(p, len(full.Peers)) {
 			min.Peers = append(min.Peers, *p)
 			if discoChanged[tnk] {
@@ -687,7 +687,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[tailcfg.
 		minner.Peers = nil
 		numRemove := 0
 		for _, p := range min.Peers {
-			if discoChanged[tailcfg.NodeKeyFromNodePublic(p.PublicKey)] {
+			if discoChanged[p.PublicKey.AsNodeKey()] {
 				numRemove++
 				continue
 			}
@@ -803,12 +803,12 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	defer e.wgLock.Unlock()
 	e.lastDNSConfig = dnsCfg
 
-	peerSet := make(map[key.Public]struct{}, len(cfg.Peers))
+	peerSet := make(map[key.NodePublic]struct{}, len(cfg.Peers))
 	e.mu.Lock()
 	e.peerSequence = e.peerSequence[:0]
 	for _, p := range cfg.Peers {
-		e.peerSequence = append(e.peerSequence, tailcfg.NodeKeyFromNodePublic(p.PublicKey))
-		peerSet[p.PublicKey.AsPublic()] = struct{}{}
+		e.peerSequence = append(e.peerSequence, p.PublicKey.AsNodeKey())
+		peerSet[p.PublicKey] = struct{}{}
 	}
 	e.mu.Unlock()
 
@@ -842,10 +842,10 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	// and a second time with it.
 	discoChanged := make(map[tailcfg.NodeKey]bool)
 	{
-		prevEP := make(map[tailcfg.NodeKey]tailcfg.DiscoKey)
+		prevEP := make(map[tailcfg.NodeKey]key.DiscoPublic)
 		for i := range e.lastCfgFull.Peers {
 			if p := &e.lastCfgFull.Peers[i]; !p.DiscoKey.IsZero() {
-				prevEP[tailcfg.NodeKeyFromNodePublic(p.PublicKey)] = p.DiscoKey
+				prevEP[p.PublicKey.AsNodeKey()] = p.DiscoKey
 			}
 		}
 		for i := range cfg.Peers {
@@ -853,7 +853,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 			if p.DiscoKey.IsZero() {
 				continue
 			}
-			pub := tailcfg.NodeKeyFromNodePublic(p.PublicKey)
+			pub := p.PublicKey.AsNodeKey()
 			if old, ok := prevEP[pub]; ok && old != p.DiscoKey {
 				discoChanged[pub] = true
 				e.logf("wgengine: Reconfig: %s changed from %q to %q", pub.ShortString(), old, p.DiscoKey)
@@ -1007,14 +1007,14 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 		}
 		switch string(k) {
 		case "public_key":
-			pk, err := key.NewPublicFromHexMem(v)
+			pk, err := key.ParseNodePublicUntyped(v)
 			if err != nil {
 				return nil, fmt.Errorf("IpcGetOperation: invalid key in line %q", line)
 			}
 			if !p.NodeKey.IsZero() {
 				pp[p.NodeKey] = p
 			}
-			p = ipnstate.PeerStatusLite{NodeKey: tailcfg.NodeKey(pk)}
+			p = ipnstate.PeerStatusLite{NodeKey: pk.AsNodeKey()}
 		case "rx_bytes":
 			n, err = mem.ParseInt(v, 10, 64)
 			p.RxBytes = n
@@ -1232,7 +1232,7 @@ func (e *userspaceEngine) SetNetworkMap(nm *netmap.NetworkMap) {
 }
 
 func (e *userspaceEngine) DiscoPublicKey() tailcfg.DiscoKey {
-	return e.magicConn.DiscoPublicKey()
+	return tailcfg.DiscoKeyFromDiscoPublic(e.magicConn.DiscoPublicKey())
 }
 
 func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
@@ -1242,7 +1242,7 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 		return
 	}
 	for _, ps := range st.Peers {
-		sb.AddPeer(key.Public(ps.NodeKey), &ipnstate.PeerStatus{
+		sb.AddPeer(key.NodePublicFromRaw32(mem.B(ps.NodeKey[:])), &ipnstate.PeerStatus{
 			RxBytes:       int64(ps.RxBytes),
 			TxBytes:       int64(ps.TxBytes),
 			LastHandshake: ps.LastHandshake,
@@ -1464,7 +1464,7 @@ func (e *userspaceEngine) peerForIP(ip netaddr.IP) (n *tailcfg.Node, isSelf bool
 			}
 			if best.IsZero() || cidr.Bits() > best.Bits() {
 				best = cidr
-				bestKey = tailcfg.NodeKeyFromNodePublic(p.PublicKey)
+				bestKey = p.PublicKey.AsNodeKey()
 			}
 		}
 	}

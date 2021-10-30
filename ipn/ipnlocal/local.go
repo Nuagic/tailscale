@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/go-multierror/multierror"
+	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
@@ -388,7 +389,7 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 				tailscaleIPs = append(tailscaleIPs, addr.IP())
 			}
 		}
-		sb.AddPeer(key.Public(p.Key), &ipnstate.PeerStatus{
+		sb.AddPeer(key.NodePublicFromRaw32(mem.B(p.Key[:])), &ipnstate.PeerStatus{
 			InNetworkMap:       true,
 			ID:                 p.StableID,
 			UserID:             p.User,
@@ -1507,7 +1508,15 @@ func (b *LocalBackend) StartLoginInteractive() {
 	if url != "" {
 		b.popBrowserAuthNow()
 	} else {
-		cc.Login(nil, controlclient.LoginInteractive)
+		flags := controlclient.LoginInteractive
+		if runtime.GOOS == "js" {
+			// The js/wasm client has no state storage so for now
+			// treat all interactive logins as ephemeral.
+			// TODO(bradfitz): if we start using browser LocalStorage
+			// or something, then rethink this.
+			flags |= controlclient.LoginEphemeral
+		}
+		cc.Login(nil, flags)
 	}
 }
 
@@ -2683,7 +2692,7 @@ func (b *LocalBackend) TestOnlyPublicKeys() (machineKey key.MachinePublic, nodeK
 
 	mk := machinePrivKey.Public()
 	nk := prefs.Persist.PrivateNodeKey.Public()
-	return mk, tailcfg.NodeKeyFromNodePublic(nk)
+	return mk, nk.AsNodeKey()
 }
 
 func (b *LocalBackend) WaitingFiles() ([]apitype.WaitingFile, error) {
@@ -2773,7 +2782,7 @@ func (b *LocalBackend) SetDNS(ctx context.Context, name, value string) error {
 	b.mu.Lock()
 	cc := b.cc
 	if prefs := b.prefs; prefs != nil {
-		req.NodeKey = tailcfg.NodeKeyFromNodePublic(prefs.Persist.PrivateNodeKey.Public())
+		req.NodeKey = prefs.Persist.PrivateNodeKey.Public().AsNodeKey()
 	}
 	b.mu.Unlock()
 	if cc == nil {

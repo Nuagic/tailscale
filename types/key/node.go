@@ -33,6 +33,10 @@ const (
 	// This prefix is used in the control protocol, so cannot be
 	// changed.
 	nodePublicHexPrefix = "nodekey:"
+
+	// NodePublicRawLen is the length in bytes of a NodePublic, when
+	// serialized with AppendTo, Raw32 or WriteRawWithoutAllocating.
+	NodePublicRawLen = 32
 )
 
 // NodePrivate is a node key, used for WireGuard tunnels and
@@ -138,15 +142,6 @@ func (k NodePrivate) UntypedHexString() string {
 	return hex.EncodeToString(k.k[:])
 }
 
-// AsPrivate returns k converted to a Private.
-//
-// Deprecated: exists only as a compatibility bridge while Private
-// gets removed from the codebase. Do not introduce new uses that
-// aren't related to #3206.
-func (k NodePrivate) AsPrivate() Private {
-	return k.k
-}
-
 // NodePublic is the public portion of a NodePrivate.
 type NodePublic struct {
 	k [32]byte
@@ -197,12 +192,6 @@ func (k NodePublic) ShortString() string {
 // buf. Returns the new slice.
 func (k NodePublic) AppendTo(buf []byte) []byte {
 	return append(buf, k.k[:]...)
-}
-
-// RawLen returns the length of k when to the format handled by
-// ReadRawWithoutAllocating and WriteRawWithoutAllocating.
-func (k NodePublic) RawLen() int {
-	return 32
 }
 
 // ReadRawWithoutAllocating initializes k with bytes read from br.
@@ -317,11 +306,9 @@ func (k NodePublic) WireGuardGoString() string {
 	return string(b)
 }
 
-// AsPublic returns k converted to a Public.
+// AsNodeKey returns k converted to a NodeKey.
 //
-// Deprecated: exists only as a compatibility bridge while Public
-// gets removed from the codebase. Do not introduce new uses that
-// aren't related to #3206.
-func (k NodePublic) AsPublic() Public {
-	return k.k
+// Cross-compatibility shim as part of #3206.
+func (k NodePublic) AsNodeKey() NodeKey {
+	return k.Raw32()
 }

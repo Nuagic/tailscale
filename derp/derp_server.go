@@ -1006,10 +1006,10 @@ func (s *Server) verifyClient(clientKey key.NodePublic, info *clientInfo) error 
 	if err != nil {
 		return fmt.Errorf("failed to query local tailscaled status: %w", err)
 	}
-	if clientKey == key.NodePublicFromRaw32(mem.B(status.Self.PublicKey[:])) {
+	if clientKey == status.Self.PublicKey {
 		return nil
 	}
-	if _, exists := status.Peer[clientKey.AsPublic()]; !exists {
+	if _, exists := status.Peer[clientKey]; !exists {
 		return fmt.Errorf("client %v not in set of peers", clientKey)
 	}
 	// TODO(bradfitz): add policy for configurable bandwidth rate per client?
@@ -1017,7 +1017,7 @@ func (s *Server) verifyClient(clientKey key.NodePublic, info *clientInfo) error 
 }
 
 func (s *Server) sendServerKey(lw *lazyBufioWriter) error {
-	buf := make([]byte, 0, len(magic)+s.publicKey.RawLen())
+	buf := make([]byte, 0, len(magic)+key.NodePublicRawLen)
 	buf = append(buf, magic...)
 	buf = s.publicKey.AppendTo(buf)
 	err := writeFrame(lw.bw(), frameServerKey, buf)
@@ -1469,7 +1469,7 @@ func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error)
 	withKey := !srcKey.IsZero()
 	pktLen := len(contents)
 	if withKey {
-		pktLen += srcKey.RawLen()
+		pktLen += key.NodePublicRawLen
 	}
 	if err = writeFrameHeader(c.bw.bw(), frameRecvPacket, uint32(pktLen)); err != nil {
 		return err
