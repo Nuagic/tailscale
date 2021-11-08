@@ -60,7 +60,7 @@ type Direct struct {
 	keepAlive              bool
 	logf                   logger.Logf
 	linkMon                *monitor.Mon // or nil
-	discoPubKey            tailcfg.DiscoKey
+	discoPubKey            key.DiscoPublic
 	getMachinePrivKey      func() (key.MachinePrivate, error)
 	debugFlags             []string
 	keepSharerAndUserSplit bool
@@ -88,7 +88,7 @@ type Options struct {
 	AuthKey              string                             // optional node auth key for auto registration
 	TimeNow              func() time.Time                   // time.Now implementation used by Client
 	Hostinfo             *tailcfg.Hostinfo                  // non-nil passes ownership, nil means to use default using os.Hostname, etc
-	DiscoPublicKey       tailcfg.DiscoKey
+	DiscoPublicKey       key.DiscoPublic
 	NewDecompressor      func() (Decompressor, error)
 	KeepAlive            bool
 	Logf                 logger.Logf
@@ -146,6 +146,13 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 
 	httpc := opts.HTTPTestClient
+	if httpc == nil && runtime.GOOS == "js" {
+		// In js/wasm, net/http.Transport (as of Go 1.18) will
+		// only use the browser's Fetch API if you're using
+		// the DefaultClient (or a client without dial hooks
+		// etc set).
+		httpc = http.DefaultClient
+	}
 	if httpc == nil {
 		dnsCache := &dnscache.Resolver{
 			Forward:          dnscache.Get().Forward, // use default cache's forwarder
@@ -357,8 +364,8 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	now := time.Now().Round(time.Second)
 	request := tailcfg.RegisterRequest{
 		Version:    1,
-		OldNodeKey: oldNodeKey.AsNodeKey(),
-		NodeKey:    tryingNewKey.Public().AsNodeKey(),
+		OldNodeKey: oldNodeKey,
+		NodeKey:    tryingNewKey.Public(),
 		Hostinfo:   hostinfo,
 		Followup:   opt.URL,
 		Timestamp:  &now,
@@ -431,7 +438,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		resp.NodeKeyExpired, resp.MachineAuthorized, resp.AuthURL != "")
 
 	if resp.Error != "" {
-		return false, "", errors.New(resp.Error)
+		return false, "", UserVisibleError(resp.Error)
 	}
 	if resp.NodeKeyExpired {
 		if regen {
@@ -595,7 +602,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	request := &tailcfg.MapRequest{
 		Version:       tailcfg.CurrentMapRequestVersion,
 		KeepAlive:     c.keepAlive,
-		NodeKey:       persist.PrivateNodeKey.Public().AsNodeKey(),
+		NodeKey:       persist.PrivateNodeKey.Public(),
 		DiscoKey:      c.discoPubKey,
 		Endpoints:     epStrs,
 		EndpointTypes: epTypes,
@@ -765,6 +772,10 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		// being conservative here, if Debug not present set to False
 		controlknobs.SetDisableUPnP(hasDebug && resp.Debug.DisableUPnP.EqualBool(true))
 		if hasDebug {
+			if code := resp.Debug.Exit; code != nil {
+				c.logf("exiting process with status %v per controlplane", *code)
+				os.Exit(*code)
+			}
 			if resp.Debug.LogHeapPprof {
 				go logheap.LogHeap(resp.Debug.LogHeapURL)
 			}
