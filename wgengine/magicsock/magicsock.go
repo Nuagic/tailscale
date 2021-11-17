@@ -96,7 +96,7 @@ type peerMap struct {
 	byNodeKey map[key.NodePublic]*peerInfo
 	byIPPort  map[netaddr.IPPort]*peerInfo
 
-	// nodesOfDisco are contains the set of nodes that are using a
+	// nodesOfDisco contains the set of nodes that are using a
 	// DiscoKey. Usually those sets will be just one node.
 	nodesOfDisco map[key.DiscoPublic]map[key.NodePublic]bool
 }
@@ -168,17 +168,12 @@ func (m *peerMap) forEachEndpointWithDiscoKey(dk key.DiscoPublic, f func(ep *end
 // upsertEndpoint stores endpoint in the peerInfo for
 // ep.publicKey, and updates indexes. m must already have a
 // tailcfg.Node for ep.publicKey.
-func (m *peerMap) upsertEndpoint(ep *endpoint) {
-	pi := m.byNodeKey[ep.publicKey]
-	if pi == nil {
-		pi = newPeerInfo(ep)
-		m.byNodeKey[ep.publicKey] = pi
-	} else {
-		old := pi.ep
-		pi.ep = ep
-		if old.discoKey != ep.discoKey {
-			delete(m.nodesOfDisco[old.discoKey], ep.publicKey)
-		}
+func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic) {
+	if m.byNodeKey[ep.publicKey] == nil {
+		m.byNodeKey[ep.publicKey] = newPeerInfo(ep)
+	}
+	if oldDiscoKey != ep.discoKey {
+		delete(m.nodesOfDisco[oldDiscoKey], ep.publicKey)
 	}
 	if !ep.discoKey.IsZero() {
 		set := m.nodesOfDisco[ep.discoKey]
@@ -967,6 +962,9 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 		// No change.
 		return true
 	}
+	if c.myDerp != 0 && derpNum != 0 {
+		metricDERPHomeChange.Add(1)
+	}
 	c.myDerp = derpNum
 	health.SetMagicSockDERPHome(derpNum)
 
@@ -1616,6 +1614,9 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 			err := dc.Send(wr.pubKey, wr.b)
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
+				metricSendDERPError.Add(1)
+			} else {
+				metricSendDERP.Add(1)
 			}
 		}
 	}
@@ -2300,8 +2301,9 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 	// handle full set updates.
 	for _, n := range nm.Peers {
 		if ep, ok := c.peerMap.endpointForNodeKey(n.Key); ok {
+			oldDiscoKey := ep.discoKey
 			ep.updateFromNode(n)
-			c.peerMap.upsertEndpoint(ep) // maybe update discokey mappings in peerMap
+			c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
 			continue
 		}
 
@@ -2341,7 +2343,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			}
 		}))
 		ep.updateFromNode(n)
-		c.peerMap.upsertEndpoint(ep)
+		c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 	}
 
 	// If the set of nodes changed since the last SetNetworkMap, the
@@ -4054,6 +4056,8 @@ var (
 	metricSendDERPErrorQueue  = clientmetric.NewCounter("magicsock_send_derp_error_queue")
 	metricSendUDP             = clientmetric.NewCounter("magicsock_send_udp")
 	metricSendUDPError        = clientmetric.NewCounter("magicsock_send_udp_error")
+	metricSendDERP            = clientmetric.NewCounter("magicsock_send_derp")
+	metricSendDERPError       = clientmetric.NewCounter("magicsock_send_derp_error")
 
 	// Data packets (non-disco)
 	metricSendData            = clientmetric.NewCounter("magicsock_send_data")
@@ -4079,4 +4083,8 @@ var (
 	metricRecvDiscoCallMeMaybe         = clientmetric.NewCounter("magicsock_disco_recv_callmemaybe")
 	metricRecvDiscoCallMeMaybeBadNode  = clientmetric.NewCounter("magicsock_disco_recv_callmemaybe_bad_node")
 	metricRecvDiscoCallMeMaybeBadDisco = clientmetric.NewCounter("magicsock_disco_recv_callmemaybe_bad_disco")
+
+	// metricDERPHomeChange is how many times our DERP home region DI has
+	// changed from non-zero to a different non-zero.
+	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
 )
