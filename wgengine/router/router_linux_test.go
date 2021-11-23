@@ -793,7 +793,7 @@ func TestDebugListRules(t *testing.T) {
 		t.Run(famName[fam], func(t *testing.T) {
 			rules, err := netlink.RuleList(fam)
 			if err != nil {
-				t.Fatal(err)
+				t.Skipf("skip; RuleList fails with: %v", err)
 			}
 			for _, r := range rules {
 				t.Logf("Rule: %+v", r)
@@ -803,7 +803,7 @@ func TestDebugListRules(t *testing.T) {
 }
 
 func TestCheckIPRuleSupportsV6(t *testing.T) {
-	err := checkIPRuleSupportsV6()
+	err := checkIPRuleSupportsV6(t.Logf)
 	if err != nil && os.Getuid() != 0 {
 		t.Skipf("skipping, error when not root: %v", err)
 	}

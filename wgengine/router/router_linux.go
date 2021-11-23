@@ -99,7 +99,7 @@ type linuxRouter struct {
 	ipRuleFixLimiter   *rate.Limiter
 
 	// Various feature checks for the network stack.
-	ipRuleAvailable bool
+	ipRuleAvailable bool // whether kernel was built with IP_MULTIPLE_TABLES
 	v6Available     bool
 	v6NATAvailable  bool
 
@@ -119,7 +119,7 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, linkMon *monitor.Mo
 		return nil, err
 	}
 
-	v6err := checkIPv6()
+	v6err := checkIPv6(logf)
 	if v6err != nil {
 		logf("disabling tunneled IPv6 due to system IPv6 config: %v", v6err)
 	}
@@ -165,8 +165,13 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, linkMon *monit
 	if r.useIPCommand() {
 		r.ipRuleAvailable = (cmd.run("ip", "rule") == nil)
 	} else {
-		// Pretend it is.
-		r.ipRuleAvailable = true
+		if rules, err := netlink.RuleList(netlink.FAMILY_V4); err != nil {
+			r.logf("error querying IP rules (does kernel have IP_MULTIPLE_TABLES?): %v", err)
+			r.logf("warning: running without policy routing")
+		} else {
+			r.logf("[v1] policy routing available; found %d rules", len(rules))
+			r.ipRuleAvailable = true
+		}
 	}
 
 	return r, nil
@@ -245,13 +250,13 @@ func (r *linuxRouter) Up() error {
 		return err
 	}
 	if err := r.addIPRules(); err != nil {
-		return err
+		return fmt.Errorf("adding IP rules: %w", err)
 	}
 	if err := r.setNetfilterMode(netfilterOff); err != nil {
-		return err
+		return fmt.Errorf("setting netfilter mode: %w", err)
 	}
 	if err := r.upInterface(); err != nil {
-		return err
+		return fmt.Errorf("bringing interface up: %w", err)
 	}
 
 	return nil
@@ -1487,7 +1492,7 @@ func cleanup(logf logger.Logf, interfaceName string) {
 // missing.  It does not check that IPv6 is currently functional or
 // that there's a global address, just that the system would support
 // IPv6 if it were on an IPv6 network.
-func checkIPv6() error {
+func checkIPv6(logf logger.Logf) error {
 	_, err := os.Stat("/proc/sys/net/ipv6")
 	if os.IsNotExist(err) {
 		return err
@@ -1519,7 +1524,7 @@ func checkIPv6() error {
 		}
 	}
 
-	if err := checkIPRuleSupportsV6(); err != nil {
+	if err := checkIPRuleSupportsV6(logf); err != nil {
 		return fmt.Errorf("kernel doesn't support IPv6 policy routing: %w", err)
 	}
 
@@ -1547,11 +1552,24 @@ func supportsV6NAT() bool {
 	return bytes.Contains(bs, []byte("nat\n"))
 }
 
-func checkIPRuleSupportsV6() error {
+func checkIPRuleSupportsV6(logf logger.Logf) error {
+	// First try just a read-only operation to ideally avoid
+	// having to modify any state.
+	if rules, err := netlink.RuleList(netlink.FAMILY_V6); err != nil {
+		return fmt.Errorf("querying IPv6 policy routing rules: %w", err)
+	} else {
+		if len(rules) > 0 {
+			logf("[v1] kernel supports IPv6 policy routing (found %d rules)", len(rules))
+			return nil
+		}
+	}
+
+	// Try to actually create & delete one as a test.
 	rule := netlink.NewRule()
 	rule.Priority = 1234
 	rule.Mark = tailscaleBypassMarkNum
 	rule.Table = tailscaleRouteTable.num
+	rule.Family = netlink.FAMILY_V6
 	// First delete the rule unconditionally, and don't check for
 	// errors. This is just cleaning up anything that might be already
 	// there.
