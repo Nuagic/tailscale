@@ -1,5 +1,5 @@
 /usr/local/bin/tailscaled --tun=userspace-networking &
-until /usr/local/bin/tailscale up --authkey=${AUTH_KEY} --hostname=${NAME} --advertise-routes=${ROUTES} --accept-dns=false
+until /usr/local/bin/tailscale up --authkey=${AUTH_KEY} --hostname=${NAME} --advertise-routes=${ROUTES} --accept-dns=false ${EXTRA_ARGS}
 do
     sleep 0.1
 done
