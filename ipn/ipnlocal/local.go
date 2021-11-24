@@ -1694,7 +1694,7 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 				// notified (to update its prefs/persist) on
 				// account switch.  Log this while we figure it
 				// out.
-				b.logf("active login: %s ([unexpected] corp#461, not %s)", newp.Persist.LoginName)
+				b.logf("active login: %q ([unexpected] corp#461, not %q)", newp.Persist.LoginName, login)
 			}
 		}
 	}
@@ -2141,6 +2141,11 @@ func (b *LocalBackend) initPeerAPIListener() {
 		tunName:        tunName,
 		selfNode:       selfNode,
 		directFileMode: b.directFileRoot != "",
+	}
+	if re, ok := b.e.(wgengine.ResolvingEngine); ok {
+		if r, ok := re.GetResolver(); ok {
+			ps.resolver = r
+		}
 	}
 	b.peerAPIServer = ps
 
@@ -2946,4 +2951,26 @@ func (b *LocalBackend) DERPMap() *tailcfg.DERPMap {
 		return nil
 	}
 	return b.netMap.DERPMap
+}
+
+// OfferingExitNode reports whether b is currently offering exit node
+// access.
+func (b *LocalBackend) OfferingExitNode() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.prefs == nil {
+		return false
+	}
+	var def4, def6 bool
+	for _, r := range b.prefs.AdvertiseRoutes {
+		if r.Bits() != 0 {
+			continue
+		}
+		if r.IP().Is4() {
+			def4 = true
+		} else if r.IP().Is6() {
+			def6 = true
+		}
+	}
+	return def4 && def6
 }
