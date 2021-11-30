@@ -100,6 +100,8 @@ type LocalBackend struct {
 
 	filterHash deephash.Sum
 
+	filterAtomic atomic.Value // of *filter.Filter
+
 	// The mutex protects the following elements.
 	mu             sync.Mutex
 	httpTestClient *http.Client // for controlclient. nil by default, used by tests.
@@ -160,9 +162,6 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, e wge
 
 	osshare.SetFileSharingEnabled(false, logf)
 
-	// Default filter blocks everything and logs nothing, until Start() is called.
-	e.SetFilter(filter.NewAllowNone(logf, &netaddr.IPSet{}))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	portpoll, err := portlist.NewPoller()
 	if err != nil {
@@ -182,6 +181,9 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, e wge
 		portpoll:       portpoll,
 		gotPortPollRes: make(chan struct{}),
 	}
+	// Default filter blocks everything and logs nothing, until Start() is called.
+	b.setFilter(filter.NewAllowNone(logf, &netaddr.IPSet{}))
+
 	b.statusChanged = sync.NewCond(&b.statusLock)
 	b.e.SetStatusCallback(b.setWgengineStatus)
 
@@ -1011,18 +1013,23 @@ func (b *LocalBackend) updateFilter(netMap *netmap.NetworkMap, prefs *ipn.Prefs)
 
 	if !haveNetmap {
 		b.logf("netmap packet filter: (not ready yet)")
-		b.e.SetFilter(filter.NewAllowNone(b.logf, logNets))
+		b.setFilter(filter.NewAllowNone(b.logf, logNets))
 		return
 	}
 
 	oldFilter := b.e.GetFilter()
 	if shieldsUp {
 		b.logf("netmap packet filter: (shields up)")
-		b.e.SetFilter(filter.NewShieldsUpFilter(localNets, logNets, oldFilter, b.logf))
+		b.setFilter(filter.NewShieldsUpFilter(localNets, logNets, oldFilter, b.logf))
 	} else {
 		b.logf("netmap packet filter: %v filters", len(packetFilter))
-		b.e.SetFilter(filter.New(packetFilter, localNets, logNets, oldFilter, b.logf))
+		b.setFilter(filter.New(packetFilter, localNets, logNets, oldFilter, b.logf))
 	}
+}
+
+func (b *LocalBackend) setFilter(f *filter.Filter) {
+	b.filterAtomic.Store(f)
+	b.e.SetFilter(f)
 }
 
 var removeFromDefaultRoute = []netaddr.IPPrefix{
@@ -1746,13 +1753,23 @@ func (b *LocalBackend) getPeerAPIPortForTSMPPing(ip netaddr.IP) (port uint16, ok
 
 func (b *LocalBackend) peerAPIServicesLocked() (ret []tailcfg.Service) {
 	for _, pln := range b.peerAPIListeners {
-		proto := tailcfg.ServiceProto("peerapi4")
+		proto := tailcfg.PeerAPI4
 		if pln.ip.Is6() {
-			proto = "peerapi6"
+			proto = tailcfg.PeerAPI6
 		}
 		ret = append(ret, tailcfg.Service{
 			Proto: proto,
 			Port:  uint16(pln.port),
+		})
+	}
+	switch runtime.GOOS {
+	case "linux", "freebsd", "openbsd", "illumos", "darwin":
+		// These are the platforms currently supported by
+		// net/dns/resolver/tsdns.go:Resolver.HandleExitNodeDNSQuery.
+		// TODO(bradfitz): add windows once it's done there.
+		ret = append(ret, tailcfg.Service{
+			Proto: tailcfg.PeerAPIDNS,
+			Port:  1, // version
 		})
 	}
 	return ret
@@ -2873,9 +2890,9 @@ func peerAPIBase(nm *netmap.NetworkMap, peer *tailcfg.Node) string {
 	var p4, p6 uint16
 	for _, s := range peer.Hostinfo.Services {
 		switch s.Proto {
-		case "peerapi4":
+		case tailcfg.PeerAPI4:
 			p4 = s.Port
-		case "peerapi6":
+		case tailcfg.PeerAPI6:
 			p6 = s.Port
 		}
 	}
@@ -3045,4 +3062,35 @@ func (b *LocalBackend) OfferingExitNode() bool {
 		}
 	}
 	return def4 && def6
+}
+
+// allowExitNodeDNSProxyToServeName reports whether the Exit Node DNS
+// proxy is allowed to serve responses for the provided DNS name.
+func (b *LocalBackend) allowExitNodeDNSProxyToServeName(name string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	nm := b.netMap
+	if nm == nil {
+		return false
+	}
+	name = strings.ToLower(name)
+	for _, bad := range nm.DNS.ExitNodeFilteredSet {
+		if bad == "" {
+			// Invalid, ignore.
+			continue
+		}
+		if bad[0] == '.' {
+			// Entries beginning with a dot are suffix matches.
+			if dnsname.HasSuffix(name, bad) {
+				return false
+			}
+			continue
+		}
+		// Otherwise entries are exact matches. They're
+		// guaranteed to be lowercase already.
+		if name == bad {
+			return false
+		}
+	}
+	return true
 }
