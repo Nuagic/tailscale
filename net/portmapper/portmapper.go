@@ -22,6 +22,7 @@ import (
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 )
 
 // Debug knobs for "tailscaled debug --portmap".
@@ -563,6 +564,8 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 	}
 }
 
+//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file pmpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pmpResultCode -trimprefix=pmpCode
+
 type pmpResultCode uint16
 
 // NAT-PMP constants.
@@ -685,11 +688,13 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 	if c.sawPMPRecently() {
 		res.PMP = true
 	} else if !DisablePMP {
+		metricPMPSent.Add(1)
 		uc.WriteTo(pmpReqExternalAddrPacket, pxpAddr)
 	}
 	if c.sawPCPRecently() {
 		res.PCP = true
 	} else if !DisablePCP {
+		metricPCPSent.Add(1)
 		uc.WriteTo(pcpAnnounceRequest(myIP), pxpAddr)
 	}
 	if c.sawUPnPRecently() {
@@ -734,6 +739,7 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 		// See https://github.com/tailscale/tailscale/issues/3197 for
 		// an example of a device that strictly implements UPnP, and
 		// only responds to multicast queries.
+		metricUPnPSent.Add(1)
 		uc.WriteTo(uPnPPacket, upnpAddr)
 		uc.WriteTo(uPnPPacket, upnpMulticastAddr)
 	}
@@ -759,11 +765,15 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 		port := uint16(addr.(*net.UDPAddr).Port)
 		switch port {
 		case c.upnpPort():
+			metricUPnPResponse.Add(1)
 			if ip == gw && mem.Contains(mem.B(buf[:n]), mem.S(":InternetGatewayDevice:")) {
 				meta, err := parseUPnPDiscoResponse(buf[:n])
 				if err != nil {
-					c.logf("unrecognized UPnP discovery response; ignoring")
+					metricUPnPParseErr.Add(1)
+					c.logf("unrecognized UPnP discovery response; ignoring: %v", err)
+					continue
 				}
+				metricUPnPOK.Add(1)
 				c.logf("[v1] UPnP reply %+v, %q", meta, buf[:n])
 				res.UPnP = true
 				c.mu.Lock()
@@ -771,10 +781,12 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 				if c.uPnPMeta != meta {
 					c.logf("UPnP meta changed: %+v", meta)
 					c.uPnPMeta = meta
+					metricUPnPUpdatedMeta.Add(1)
 				}
 				c.mu.Unlock()
 			}
 		case c.pxpPort(): // same value for PMP and PCP
+			metricPXPResponse.Add(1)
 			if pres, ok := parsePCPResponse(buf[:n]); ok {
 				if pres.OpCode == pcpOpReply|pcpOpAnnounce {
 					pcpHeard = true
@@ -785,25 +797,35 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 					case pcpCodeOK:
 						c.logf("[v1] Got PCP response: epoch: %v", pres.Epoch)
 						res.PCP = true
+						metricPCPOK.Add(1)
 						continue
 					case pcpCodeNotAuthorized:
 						// A PCP service is running, but refuses to
 						// provide port mapping services.
 						res.PCP = false
+						metricPCPNotAuthorized.Add(1)
+						continue
+					case pcpCodeAddressMismatch:
+						// A PCP service is running, but it is behind a NAT, so it can't help us.
+						res.PCP = false
+						metricPCPAddressMismatch.Add(1)
 						continue
 					default:
 						// Fall through to unexpected log line.
 					}
 				}
+				metricPCPUnhandledResponseCode.Add(1)
 				c.logf("unexpected PCP probe response: %+v", pres)
 			}
 			if pres, ok := parsePMPResponse(buf[:n]); ok {
 				if pres.OpCode != pmpOpReply|pmpOpMapPublicAddr {
 					c.logf("unexpected PMP probe response opcode: %+v", pres)
+					metricPMPUnhandledOpcode.Add(1)
 					continue
 				}
 				switch pres.ResultCode {
 				case pmpCodeOK:
+					metricPMPOK.Add(1)
 					c.logf("[v1] Got PMP response; IP: %v, epoch: %v", pres.PublicAddr, pres.SecondsSinceEpoch)
 					res.PMP = true
 					c.mu.Lock()
@@ -812,11 +834,20 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 					c.pmpLastEpoch = pres.SecondsSinceEpoch
 					c.mu.Unlock()
 					continue
-				case pmpCodeNotAuthorized, pmpCodeNetworkFailure, pmpCodeOutOfResources:
-					// Normal failures.
+				case pmpCodeNotAuthorized:
+					metricPMPNotAuthorized.Add(1)
+					c.logf("PMP probe failed due result code: %+v", pres)
+					continue
+				case pmpCodeNetworkFailure:
+					metricPMPNetworkFailure.Add(1)
+					c.logf("PMP probe failed due result code: %+v", pres)
+					continue
+				case pmpCodeOutOfResources:
+					metricPMPOutOfResources.Add(1)
 					c.logf("PMP probe failed due result code: %+v", pres)
 					continue
 				}
+				metricPMPUnhandledResponseCode.Add(1)
 				c.logf("unexpected PMP probe response: %+v", pres)
 			}
 		}
@@ -835,3 +866,74 @@ var uPnPPacket = []byte("M-SEARCH * HTTP/1.1\r\n" +
 	"ST: ssdp:all\r\n" +
 	"MAN: \"ssdp:discover\"\r\n" +
 	"MX: 2\r\n\r\n")
+
+// PCP/PMP metrics
+var (
+	// metricPXPResponse counts the number of times we received a PMP/PCP response.
+	metricPXPResponse = clientmetric.NewCounter("portmap_pxp_response")
+
+	// metricPCPSent counts the number of times we sent a PCP request.
+	metricPCPSent = clientmetric.NewCounter("portmap_pcp_sent")
+
+	// metricPCPOK counts the number of times
+	// we received a successful PCP response.
+	metricPCPOK = clientmetric.NewCounter("portmap_pcp_ok")
+
+	// metricPCPAddressMismatch counts the number of times
+	// we received a PCP address mismatch result code.
+	metricPCPAddressMismatch = clientmetric.NewCounter("portmap_pcp_address_mismatch")
+
+	// metricPCPNotAuthorized counts the number of times
+	// we received a PCP not authorized result code.
+	metricPCPNotAuthorized = clientmetric.NewCounter("portmap_pcp_not_authorized")
+
+	// metricPCPUnhandledResponseCode counts the number of times
+	// we received an (as yet) unhandled PCP result code.
+	metricPCPUnhandledResponseCode = clientmetric.NewCounter("portmap_pcp_unhandled_response_code")
+
+	// metricPMPSent counts the number of times we sent a PMP request.
+	metricPMPSent = clientmetric.NewCounter("portmap_pmp_sent")
+
+	// metricPMPOK counts the number of times
+	// we received a succesful PMP response.
+	metricPMPOK = clientmetric.NewCounter("portmap_pmp_ok")
+
+	// metricPMPUnhandledOpcode counts the number of times
+	// we received an unhandled PMP opcode.
+	metricPMPUnhandledOpcode = clientmetric.NewCounter("portmap_pmp_unhandled_opcode")
+
+	// metricPMPUnhandledResponseCode counts the number of times
+	// we received an unhandled PMP result code.
+	metricPMPUnhandledResponseCode = clientmetric.NewCounter("portmap_pmp_unhandled_response_code")
+
+	// metricPMPOutOfResources counts the number of times
+	// we received a PCP out of resources result code.
+	metricPMPOutOfResources = clientmetric.NewCounter("portmap_pmp_out_of_resources")
+
+	// metricPMPNetworkFailure counts the number of times
+	// we received a PCP network failure result code.
+	metricPMPNetworkFailure = clientmetric.NewCounter("portmap_pmp_network_failure")
+
+	// metricPMPNotAuthorized counts the number of times
+	// we received a PCP not authorized result code.
+	metricPMPNotAuthorized = clientmetric.NewCounter("portmap_pmp_not_authorized")
+)
+
+// UPnP metrics
+var (
+	// metricUPnPSent counts the number of times we sent a UPnP request.
+	metricUPnPSent = clientmetric.NewCounter("portmap_upnp_sent")
+
+	// metricUPnPResponse counts the number of times we received a UPnP response.
+	metricUPnPResponse = clientmetric.NewCounter("portmap_upnp_response")
+
+	// metricUPnPParseErr counts the number of times we failed to parse a UPnP response.
+	metricUPnPParseErr = clientmetric.NewCounter("portmap_upnp_parse_err")
+
+	// metricUPnPOK counts the number of times we received a usable UPnP response.
+	metricUPnPOK = clientmetric.NewCounter("portmap_upnp_ok")
+
+	// metricUPnPUpdatedMeta counts the number of times
+	// we received a UPnP response with a new meta.
+	metricUPnPUpdatedMeta = clientmetric.NewCounter("portmap_upnp_updated_meta")
+)
