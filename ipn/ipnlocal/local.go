@@ -22,7 +22,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"inet.af/netaddr"
@@ -36,6 +35,7 @@ import (
 	"tailscale.com/net/dns"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
 	"tailscale.com/portlist"
 	"tailscale.com/tailcfg"
@@ -88,6 +88,7 @@ type LocalBackend struct {
 	statsLogf             logger.Logf        // for printing peers stats on change
 	e                     wgengine.Engine
 	store                 ipn.StateStore
+	dialer                *tsdial.Dialer // non-nil
 	backendLogID          string
 	unregisterLinkMon     func()
 	unregisterHealthWatch func()
@@ -155,10 +156,18 @@ type clientGen func(controlclient.Options) (controlclient.Client, error)
 
 // NewLocalBackend returns a new LocalBackend that is ready to run,
 // but is not actually running.
-func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, e wgengine.Engine) (*LocalBackend, error) {
+//
+// If dialer is nil, a new one is made.
+func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, dialer *tsdial.Dialer, e wgengine.Engine) (*LocalBackend, error) {
 	if e == nil {
-		panic("ipn.NewLocalBackend: wgengine must not be nil")
+		panic("ipn.NewLocalBackend: engine must not be nil")
 	}
+	if dialer == nil {
+		dialer = new(tsdial.Dialer)
+	}
+	e.AddNetworkMapCallback(func(nm *netmap.NetworkMap) {
+		dialer.SetDNSMap(tsdial.DNSMapFromNetworkMap(nm))
+	})
 
 	osshare.SetFileSharingEnabled(false, logf)
 
@@ -176,11 +185,13 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, e wge
 		statsLogf:      logger.LogOnChange(logf, 5*time.Minute, time.Now),
 		e:              e,
 		store:          store,
+		dialer:         dialer,
 		backendLogID:   logid,
 		state:          ipn.NoState,
 		portpoll:       portpoll,
 		gotPortPollRes: make(chan struct{}),
 	}
+
 	// Default filter blocks everything and logs nothing, until Start() is called.
 	b.setFilter(filter.NewAllowNone(logf, &netaddr.IPSet{}))
 
@@ -208,6 +219,11 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, e wge
 	}
 
 	return b, nil
+}
+
+// Dialer returns the backend's dialer.
+func (b *LocalBackend) Dialer() *tsdial.Dialer {
+	return b.dialer
 }
 
 // SetDirectFileRoot sets the directory to download files to directly,
@@ -604,6 +620,11 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 // findExitNodeIDLocked updates b.prefs to reference an exit node by ID,
 // rather than by IP. It returns whether prefs was mutated.
 func (b *LocalBackend) findExitNodeIDLocked(nm *netmap.NetworkMap) (prefsChanged bool) {
+	if nm == nil {
+		// No netmap, can't resolve anything.
+		return false
+	}
+
 	// If we have a desired IP on file, try to find the corresponding
 	// node.
 	if b.prefs.ExitNodeIP.IsZero() {
@@ -1263,7 +1284,7 @@ func (b *LocalBackend) send(n ipn.Notify) {
 		return
 	}
 
-	if apiSrv != nil && apiSrv.hasFilesWaiting() {
+	if apiSrv.hasFilesWaiting() {
 		n.FilesWaiting = &empty.Message{}
 	}
 
@@ -1672,7 +1693,7 @@ func (b *LocalBackend) SetPrefs(newp *ipn.Prefs) {
 }
 
 // setPrefsLockedOnEntry requires b.mu be held to call it, but it
-// unlocks b.mu when done.
+// unlocks b.mu when done. newp ownership passes to this function.
 func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 	netMap := b.netMap
 	stateKey := b.stateKey
@@ -1680,6 +1701,10 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 	oldp := b.prefs
 	newp.Persist = oldp.Persist // caller isn't allowed to override this
 	b.prefs = newp
+	// findExitNodeIDLocked returns whether it updated b.prefs, but
+	// everything in this function treats b.prefs as completely new
+	// anyway. No-op if no exit node resolution is needed.
+	b.findExitNodeIDLocked(netMap)
 	b.inServerMode = newp.ForceDaemon
 	// We do this to avoid holding the lock while doing everything else.
 	newp = b.prefs.Clone()
@@ -2093,7 +2118,7 @@ func (b *LocalBackend) fileRootLocked(uid tailcfg.UserID) string {
 	}
 	varRoot := b.TailscaleVarRoot()
 	if varRoot == "" {
-		b.logf("peerapi disabled; no state directory")
+		b.logf("Taildrop disabled; no state directory")
 		return ""
 	}
 	baseDir := fmt.Sprintf("%s-uid-%d",
@@ -2101,7 +2126,7 @@ func (b *LocalBackend) fileRootLocked(uid tailcfg.UserID) string {
 		uid)
 	dir := filepath.Join(varRoot, "files", baseDir)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		b.logf("peerapi disabled; error making directory: %v", err)
+		b.logf("Taildrop disabled; error making directory: %v", err)
 		return ""
 	}
 	return dir
@@ -2164,20 +2189,12 @@ func (b *LocalBackend) initPeerAPIListener() {
 
 	fileRoot := b.fileRootLocked(selfNode.User)
 	if fileRoot == "" {
-		return
-	}
-
-	var tunName string
-	if ge, ok := b.e.(wgengine.InternalsGetter); ok {
-		if tunWrap, _, ok := ge.GetInternals(); ok {
-			tunName, _ = tunWrap.Name()
-		}
+		b.logf("peerapi starting without Taildrop directory configured")
 	}
 
 	ps := &peerAPIServer{
 		b:              b,
 		rootDir:        fileRoot,
-		tunName:        tunName,
 		selfNode:       selfNode,
 		directFileMode: b.directFileRoot != "",
 	}
@@ -2766,9 +2783,6 @@ func (b *LocalBackend) WaitingFiles() ([]apitype.WaitingFile, error) {
 	b.mu.Lock()
 	apiSrv := b.peerAPIServer
 	b.mu.Unlock()
-	if apiSrv == nil {
-		return nil, errors.New("peerapi disabled")
-	}
 	return apiSrv.WaitingFiles()
 }
 
@@ -2776,9 +2790,6 @@ func (b *LocalBackend) DeleteFile(name string) error {
 	b.mu.Lock()
 	apiSrv := b.peerAPIServer
 	b.mu.Unlock()
-	if apiSrv == nil {
-		return errors.New("peerapi disabled")
-	}
 	return apiSrv.DeleteFile(name)
 }
 
@@ -2786,9 +2797,6 @@ func (b *LocalBackend) OpenFile(name string) (rc io.ReadCloser, size int64, err 
 	b.mu.Lock()
 	apiSrv := b.peerAPIServer
 	b.mu.Unlock()
-	if apiSrv == nil {
-		return nil, 0, errors.New("peerapi disabled")
-	}
 	return apiSrv.OpenFile(name)
 }
 
@@ -3029,19 +3037,6 @@ func disabledSysctls(sysctls ...string) (disabled []string, err error) {
 		}
 	}
 	return disabled, nil
-}
-
-// peerDialControlFunc is non-nil on platforms that require a way to
-// bind to dial out to other peers.
-var peerDialControlFunc func(*LocalBackend) func(network, address string, c syscall.RawConn) error
-
-// PeerDialControlFunc returns a net.Dialer.Control func (possibly nil) to use to
-// dial other Tailscale peers from the current environment.
-func (b *LocalBackend) PeerDialControlFunc() func(network, address string, c syscall.RawConn) error {
-	if peerDialControlFunc != nil {
-		return peerDialControlFunc(b)
-	}
-	return nil
 }
 
 // DERPMap returns the current DERPMap in use, or nil if not connected.

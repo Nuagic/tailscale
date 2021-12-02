@@ -38,16 +38,19 @@ import (
 	"tailscale.com/log/filelogger"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netstat"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netmap"
 	"tailscale.com/util/groupmember"
 	"tailscale.com/util/pidowner"
 	"tailscale.com/util/systemd"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/monitor"
 )
 
 // Options is the configuration of the Tailscale node agent.
@@ -651,7 +654,7 @@ func StateStore(path string, logf logger.Logf) (ipn.StateStore, error) {
 // The getEngine func is called repeatedly, once per connection, until it returns an engine successfully.
 //
 // Deprecated: use New and Server.Run instead.
-func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.StateStore, logid string, getEngine func() (wgengine.Engine, error), opts Options) error {
+func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.StateStore, linkMon *monitor.Mon, logid string, getEngine func() (wgengine.Engine, error), opts Options) error {
 	getEngine = getEngineUntilItWorksWrapper(getEngine)
 	runDone := make(chan struct{})
 	defer close(runDone)
@@ -735,7 +738,12 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 		}
 	}
 
-	server, err := New(logf, logid, store, eng, serverModeUser, opts)
+	dialer := new(tsdial.Dialer)
+	eng.AddNetworkMapCallback(func(nm *netmap.NetworkMap) {
+		dialer.SetDNSMap(tsdial.DNSMapFromNetworkMap(nm))
+	})
+
+	server, err := New(logf, logid, store, eng, dialer, serverModeUser, opts)
 	if err != nil {
 		return err
 	}
@@ -748,8 +756,8 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 // New returns a new Server.
 //
 // To start it, use the Server.Run method.
-func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, serverModeUser *user.User, opts Options) (*Server, error) {
-	b, err := ipnlocal.NewLocalBackend(logf, logid, store, eng)
+func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, dialer *tsdial.Dialer, serverModeUser *user.User, opts Options) (*Server, error) {
+	b, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng)
 	if err != nil {
 		return nil, fmt.Errorf("NewLocalBackend: %v", err)
 	}
