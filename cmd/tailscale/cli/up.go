@@ -28,6 +28,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/version/distro"
 )
 
@@ -46,8 +47,10 @@ down").
 
 If flags are specified, the flags must be the complete set of desired
 settings. An error is returned if any setting would be changed as a
-result of an unspecified flag's default value, unless the --reset
-flag is also used.
+result of an unspecified flag's default value, unless the --reset flag
+is also used. (The flags --authkey, --force-reauth, and --qr are not
+considered settings that need to be re-specified when modifying
+settings.)
 `),
 	FlagSet: upFlagSet,
 	Exec:    runUp,
@@ -73,7 +76,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", false, "accept routes advertised by other Tailscale nodes")
 	upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
 	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "install host routes to other Tailscale nodes")
-	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale IP of the exit node for internet traffic, or empty string to not use an exit node")
+	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
 	upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "comma-separated ACL tags to request; each must start with \"tag:\" (e.g. \"tag:eng,tag:montreal,tag:ssh\")")
@@ -190,6 +193,65 @@ func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 	return routes, nil
 }
 
+// peerWithTailscaleIP returns the peer in st with the provided
+// Tailscale IP.
+func peerWithTailscaleIP(st *ipnstate.Status, ip netaddr.IP) (ps *ipnstate.PeerStatus, ok bool) {
+	for _, ps := range st.Peer {
+		for _, ip2 := range ps.TailscaleIPs {
+			if ip == ip2 {
+				return ps, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// exitNodeIPOfArg maps from a user-provided CLI flag value to an IP
+// address they want to use as an exit node.
+func exitNodeIPOfArg(arg string, st *ipnstate.Status) (ip netaddr.IP, err error) {
+	if arg == "" {
+		return ip, errors.New("invalid use of exitNodeIPOfArg with empty string")
+	}
+	ip, err = netaddr.ParseIP(arg)
+	if err == nil {
+		// If we're online already and have a netmap, double check that the IP
+		// address specified is valid.
+		if st.BackendState == "Running" {
+			ps, ok := peerWithTailscaleIP(st, ip)
+			if !ok {
+				return ip, fmt.Errorf("no node found in netmap with IP %v", ip)
+			}
+			if !ps.ExitNodeOption {
+				return ip, fmt.Errorf("node %v is not advertising an exit node", ip)
+			}
+		}
+		return ip, err
+	}
+	match := 0
+	for _, ps := range st.Peer {
+		baseName := dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)
+		if !strings.EqualFold(arg, baseName) {
+			continue
+		}
+		match++
+		if len(ps.TailscaleIPs) == 0 {
+			return ip, fmt.Errorf("node %q has no Tailscale IP?", arg)
+		}
+		if !ps.ExitNodeOption {
+			return ip, fmt.Errorf("node %q is not advertising an exit node", arg)
+		}
+		ip = ps.TailscaleIPs[0]
+	}
+	switch match {
+	case 0:
+		return ip, fmt.Errorf("invalid value %q for --exit-node; must be IP or unique node name", arg)
+	case 1:
+		return ip, nil
+	default:
+		return ip, fmt.Errorf("ambiguous exit node name %q", arg)
+	}
+}
+
 // prefsFromUpArgs returns the ipn.Prefs for the provided args.
 //
 // Note that the parameters upArgs and warnf are named intentionally
@@ -205,9 +267,9 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	var exitNodeIP netaddr.IP
 	if upArgs.exitNodeIP != "" {
 		var err error
-		exitNodeIP, err = netaddr.ParseIP(upArgs.exitNodeIP)
+		exitNodeIP, err = exitNodeIPOfArg(upArgs.exitNodeIP, st)
 		if err != nil {
-			return nil, fmt.Errorf("invalid IP address %q for --exit-node: %v", upArgs.exitNodeIP, err)
+			return nil, err
 		}
 	} else if upArgs.exitNodeAllowLANAccess {
 		return nil, fmt.Errorf("--exit-node-allow-lan-access can only be used with --exit-node")
@@ -385,7 +447,7 @@ func runUp(ctx context.Context, args []string) error {
 		flagSet:       upFlagSet,
 		upArgs:        upArgs,
 		backendState:  st.BackendState,
-		curExitNodeIP: exitNodeIP(prefs, st),
+		curExitNodeIP: exitNodeIP(curPrefs, st),
 	}
 	simpleUp, justEditMP, err := updatePrefs(prefs, curPrefs, env)
 	if err != nil {
