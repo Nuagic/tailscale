@@ -62,7 +62,7 @@ func TestMain(m *testing.M) {
 	os.Exit(0)
 }
 
-func TestOneNodeUp_NoAuth(t *testing.T) {
+func TestOneNodeUpNoAuth(t *testing.T) {
 	t.Parallel()
 	bins := BuildTestBinaries(t)
 
@@ -190,7 +190,7 @@ func TestStateSavedOnStart(t *testing.T) {
 	d1.MustCleanShutdown(t)
 }
 
-func TestOneNodeUp_Auth(t *testing.T) {
+func TestOneNodeUpAuth(t *testing.T) {
 	t.Parallel()
 	bins := BuildTestBinaries(t)
 
@@ -700,8 +700,11 @@ func (n *testNode) MustUp(extraArgs ...string) {
 		"--login-server=" + n.env.ControlServer.URL,
 	}
 	args = append(args, extraArgs...)
-	t.Logf("Running %v ...", args)
-	if b, err := n.Tailscale(args...).CombinedOutput(); err != nil {
+	cmd := n.Tailscale(args...)
+	t.Logf("Running %v ...", cmd)
+	cmd.Stdout = nil // in case --verbose-tailscale was set
+	cmd.Stderr = nil // in case --verbose-tailscale was set
+	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("up: %v, %v", string(b), err)
 	}
 }
@@ -717,8 +720,10 @@ func (n *testNode) MustDown() {
 // AwaitListening waits for the tailscaled to be serving local clients
 // over its localhost IPC mechanism. (Unix socket, etc)
 func (n *testNode) AwaitListening(t testing.TB) {
+	s := safesocket.DefaultConnectionStrategy(n.sockFile)
+	s.UseFallback(false) // connect only to the tailscaled that we started
 	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.Connect(n.sockFile, safesocket.WindowsLocalPort)
+		c, err := safesocket.Connect(s)
 		if err != nil {
 			return err
 		}
