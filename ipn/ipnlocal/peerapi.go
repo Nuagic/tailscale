@@ -32,6 +32,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/logtail/backoff"
@@ -553,6 +554,12 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v0/metrics":
 		h.handleServeMetrics(w, r)
 		return
+	case "/v0/magicsock":
+		h.handleServeMagicsock(w, r)
+		return
+	case "/v0/dnsfwd":
+		h.handleServeDNSFwd(w, r)
+		return
 	}
 	who := h.peerUser.DisplayName
 	fmt.Fprintf(w, `<html>
@@ -781,6 +788,21 @@ func (h *peerAPIHandler) handleServeEnv(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(data)
 }
 
+func (h *peerAPIHandler) handleServeMagicsock(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	eng := h.ps.b.e
+	if ig, ok := eng.(wgengine.InternalsGetter); ok {
+		if _, mc, ok := ig.GetInternals(); ok {
+			mc.ServeHTTPDebug(w, r)
+			return
+		}
+	}
+	http.Error(w, "miswired", 500)
+}
+
 func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Request) {
 	if !h.isSelf {
 		http.Error(w, "not owner", http.StatusForbidden)
@@ -788,6 +810,19 @@ func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	clientmetric.WritePrometheusExpositionFormat(w)
+}
+
+func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	dh := health.DebugHandler("dnsfwd")
+	if dh == nil {
+		http.Error(w, "not wired up", 500)
+		return
+	}
+	dh.ServeHTTP(w, r)
 }
 
 func (h *peerAPIHandler) replyToDNSQueries() bool {
