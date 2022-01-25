@@ -21,4 +21,5 @@ jobs:
           git merge --no-edit upstream/main
           git push origin main
           git push origin main --tags
+          git push origin --tags
 
