@@ -102,8 +102,6 @@ coho
 lake
 arctic
 pumpkinseed
-salamander
-mudpuppy
 gopher
 chickadee
 toad

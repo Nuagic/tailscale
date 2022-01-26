@@ -15,14 +15,13 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 )
 
 var single = &Resolver{
@@ -100,7 +99,7 @@ func (r *Resolver) ttl() time.Duration {
 	return 10 * time.Minute
 }
 
-var debug, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_DNS_CACHE"))
+var debug = envknob.Bool("TS_DEBUG_DNS_CACHE")
 
 // LookupIP returns the host's primary IP address (either IPv4 or
 // IPv6, but preferring IPv4) and optionally its IPv6 address, if
@@ -444,24 +443,9 @@ func TLSDialer(fwd DialContextFunc, dnsCache *Resolver, tlsConfigBase *tls.Confi
 		}
 		tlsConn := tls.Client(tcpConn, cfg)
 
-		errc := make(chan error, 2)
 		handshakeCtx, handshakeTimeoutCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer handshakeTimeoutCancel()
-		done := make(chan bool)
-		defer close(done)
-		go func() {
-			select {
-			case <-done:
-			case <-handshakeCtx.Done():
-				errc <- errTLSHandshakeTimeout
-			}
-		}()
-		go func() {
-			err := tlsConn.Handshake()
-			handshakeTimeoutCancel()
-			errc <- err
-		}()
-		if err := <-errc; err != nil {
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			tcpConn.Close()
 			// TODO: if err != errTLSHandshakeTimeout,
 			// assume it might be some captive portal or

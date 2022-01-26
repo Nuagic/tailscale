@@ -23,12 +23,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/logpolicy"
@@ -41,6 +41,7 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
+	"tailscale.com/tsweb"
 	"tailscale.com/types/flagtype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
@@ -223,7 +224,7 @@ func statePathOrDefault() string {
 func ipnServerOpts() (o ipnserver.Options) {
 	// Allow changing the OS-specific IPN behavior for tests
 	// so we can e.g. test Windows-specific behaviors on Linux.
-	goos := os.Getenv("TS_DEBUG_TAILSCALED_IPN_GOOS")
+	goos := envknob.String("TS_DEBUG_TAILSCALED_IPN_GOOS")
 	if goos == "" {
 		goos = runtime.GOOS
 	}
@@ -271,13 +272,13 @@ func run() error {
 	}
 
 	var logf logger.Logf = log.Printf
-	if v, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_MEMORY")); v {
+	if envknob.Bool("TS_DEBUG_MEMORY") {
 		logf = logger.RusagePrefixLog(logf)
 	}
 	logf = logger.RateLimitedFn(logf, 5*time.Second, 5, 100)
 
 	if args.cleanup {
-		if os.Getenv("TS_PLEASE_PANIC") != "" {
+		if envknob.Bool("TS_PLEASE_PANIC") {
 			panic("TS_PLEASE_PANIC asked us to panic")
 		}
 		dns.Cleanup(logf, args.tunname)
@@ -328,9 +329,6 @@ func run() error {
 	}
 	ns.ProcessLocalIPs = useNetstack
 	ns.ProcessSubnets = useNetstack || wrapNetstack
-	if err := ns.Start(); err != nil {
-		return fmt.Errorf("failed to start netstack: %w", err)
-	}
 
 	if useNetstack {
 		dialer.UseNetstackForIP = func(ip netaddr.IP) bool {
@@ -341,7 +339,6 @@ func run() error {
 			return ns.DialContextTCP(ctx, dst)
 		}
 	}
-
 	if socksListener != nil || httpProxyListener != nil {
 		if httpProxyListener != nil {
 			hs := &http.Server{Handler: httpProxyHandler(dialer.UserDial)}
@@ -391,6 +388,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("ipnserver.New: %w", err)
 	}
+	ns.SetLocalBackend(srv.LocalBackend())
+	if err := ns.Start(); err != nil {
+		log.Fatalf("failed to start netstack: %v", err)
+	}
 
 	if debugMux != nil {
 		debugMux.HandleFunc("/debug/ipn", srv.ServeHTMLStatus)
@@ -430,11 +431,7 @@ func createEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer)
 var wrapNetstack = shouldWrapNetstack()
 
 func shouldWrapNetstack() bool {
-	if e := os.Getenv("TS_DEBUG_WRAP_NETSTACK"); e != "" {
-		v, err := strconv.ParseBool(e)
-		if err != nil {
-			log.Fatalf("invalid TS_DEBUG_WRAP_NETSTACK value: %v", err)
-		}
+	if v, ok := envknob.LookupBool("TS_DEBUG_WRAP_NETSTACK"); ok {
 		return v
 	}
 	if distro.Get() == distro.Synology {
@@ -514,6 +511,7 @@ func newDebugMux() *http.ServeMux {
 
 func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
+	tsweb.VarzHandler(w, r)
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 

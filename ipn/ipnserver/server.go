@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"inet.af/netaddr"
 	"inet.af/peercred"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
@@ -442,6 +444,26 @@ func (s *Server) localAPIPermissions(ci connIdentity) (read, write bool) {
 		return true, !isReadonlyConn(ci, s.b.OperatorUserID(), logger.Discard)
 	}
 	return false, false
+}
+
+// connCanFetchCerts reports whether ci is allowed to fetch HTTPS
+// certs from this server when it wouldn't otherwise be able to.
+//
+// That is, this reports whether ci should grant additional
+// capabilities over what the conn would otherwise be able to do.
+//
+// For now this only returns true on Unix machines when
+// TS_PERMIT_CERT_UID is set the to the userid of the peer
+// connection. It's intended to give your non-root webserver access
+// (www-data, caddy, nginx, etc) to certs.
+func (s *Server) connCanFetchCerts(ci connIdentity) bool {
+	if ci.IsUnixSock && ci.Creds != nil {
+		connUID, ok := ci.Creds.UserID()
+		if ok && connUID == envknob.String("TS_PERMIT_CERT_UID") {
+			return true
+		}
+	}
+	return false
 }
 
 // registerDisconnectSub adds ch as a subscribe to connection disconnect
@@ -915,6 +937,14 @@ func BabysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		startTime := time.Now()
 		log.Printf("exec: %#v %v", executable, args)
 		cmd := exec.Command(executable, args...)
+		if runtime.GOOS == "windows" {
+			extraEnv, err := loadExtraEnv()
+			if err != nil {
+				logf("errors loading extra env file; ignoring: %v", err)
+			} else {
+				cmd.Env = append(os.Environ(), extraEnv...)
+			}
+		}
 
 		// Create a pipe object to use as the subproc's stdin.
 		// When the writer goes away, the reader gets EOF.
@@ -1066,6 +1096,7 @@ func (psc *protoSwitchConn) Close() error {
 func (s *Server) localhostHandler(ci connIdentity) http.Handler {
 	lah := localapi.NewHandler(s.b, s.logf, s.backendLogID)
 	lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
+	lah.PermitCert = s.connCanFetchCerts(ci)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/localapi/") {
@@ -1183,4 +1214,48 @@ func findTrueNASTaildropDir(name string) (dir string, err error) {
 		}
 	}
 	return "", fmt.Errorf("shared folder %q not found", name)
+}
+
+func loadExtraEnv() (env []string, err error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	name := filepath.Join(os.Getenv("ProgramData"), "Tailscale", "tailscaled-env.txt")
+	contents, err := os.ReadFile(name)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := stringsCut(line, "=")
+		if !ok || k == "" {
+			continue
+		}
+		if strings.HasPrefix(v, `"`) {
+			var err error
+			v, err = strconv.Unquote(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value in line %q: %v", line, err)
+			}
+			env = append(env, k+"="+v)
+		} else {
+			env = append(env, line)
+		}
+	}
+	return env, nil
+}
+
+// stringsCut is Go 1.18's strings.Cut.
+// TODO(bradfitz): delete this when we depend on Go 1.18.
+func stringsCut(s, sep string) (before, after string, found bool) {
+	if i := strings.Index(s, sep); i >= 0 {
+		return s[:i], s[i+len(sep):], true
+	}
+	return s, "", false
 }

@@ -61,14 +61,14 @@ import (
 // useDerpRoute reports whether magicsock should enable the DERP
 // return path optimization (Issue 150).
 func useDerpRoute() bool {
-	if debugUseDerpRouteEnv != "" {
-		return debugUseDerpRoute
+	if b, ok := debugUseDerpRoute.Get(); ok {
+		return b
 	}
 	ob := controlclient.DERPRouteFlag()
 	if v, ok := ob.Get(); ok {
 		return v
 	}
-	return false
+	return true // as of 1.21.x
 }
 
 // peerInfo is all the information magicsock tracks about a particular
@@ -265,6 +265,7 @@ type Conn struct {
 	stunReceiveFunc atomic.Value // of func(p []byte, fromAddr *net.UDPAddr)
 
 	// derpRecvCh is used by receiveDERP to read DERP messages.
+	// It must have buffer size > 0; see issue 3736.
 	derpRecvCh chan derpReadResult
 
 	// bind is the wireguard-go conn.Bind for Conn.
@@ -299,11 +300,18 @@ type Conn struct {
 	havePrivateKey  syncs.AtomicBool
 	publicKeyAtomic atomic.Value // of key.NodePublic (or NodeKey zero value if !havePrivateKey)
 
+	// derpMapAtomic is the same as derpMap, but without requiring
+	// sync.Mutex. For use with NewRegionClient's callback, to avoid
+	// lock ordering deadlocks. See issue 3726 and mu field docs.
+	derpMapAtomic atomic.Value // of *tailcfg.DERPMap
+
 	// port is the preferred port from opts.Port; 0 means auto.
 	port syncs.AtomicUint32
 
 	// ============================================================
-	// mu guards all following fields; see userspaceEngine lock ordering rules
+	// mu guards all following fields; see userspaceEngine lock
+	// ordering rules against the engine. For derphttp, mu must
+	// be held before derphttp.Client.mu.
 	mu     sync.Mutex
 	muCond *sync.Cond
 
@@ -522,7 +530,7 @@ func (o *Options) derpActiveFunc() func() {
 // of NewConn. Mostly for tests.
 func newConn() *Conn {
 	c := &Conn{
-		derpRecvCh:   make(chan derpReadResult),
+		derpRecvCh:   make(chan derpReadResult, 1), // must be buffered, see issue 3736
 		derpStarted:  make(chan struct{}),
 		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
@@ -1351,19 +1359,23 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.NodePublic) cha
 	}
 
 	// Note that derphttp.NewRegionClient does not dial the server
-	// so it is safe to do under the mu lock.
+	// (it doesn't block) so it is safe to do under the c.mu lock.
 	dc := derphttp.NewRegionClient(c.privateKey, c.logf, func() *tailcfg.DERPRegion {
+		// Warning: it is not legal to acquire
+		// magicsock.Conn.mu from this callback.
+		// It's run from derphttp.Client.connect (via Send, etc)
+		// and the lock ordering rules are that magicsock.Conn.mu
+		// must be acquired before derphttp.Client.mu.
+		// See https://github.com/tailscale/tailscale/issues/3726
 		if c.connCtx.Err() != nil {
-			// If we're closing, don't try to acquire the lock.
-			// We might already be in Conn.Close and the Lock would deadlock.
+			// We're closing anyway; return nil to stop dialing.
 			return nil
 		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.derpMap == nil {
+		derpMap, _ := c.derpMapAtomic.Load().(*tailcfg.DERPMap)
+		if derpMap == nil {
 			return nil
 		}
-		return c.derpMap.Regions[regionID]
+		return derpMap.Regions[regionID]
 	})
 
 	dc.SetCanAckPings(true)
@@ -1497,6 +1509,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 	peerPresent := map[key.NodePublic]bool{}
 	bo := backoff.NewBackoff(fmt.Sprintf("derp-%d", regionID), c.logf, 5*time.Second)
 	var lastPacketTime time.Time
+	var lastPacketSrc key.NodePublic
 
 	for {
 		msg, connGen, err := dc.RecvDetail()
@@ -1558,9 +1571,12 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 			}
 			// If this is a new sender we hadn't seen before, remember it and
 			// register a route for this peer.
-			if _, ok := peerPresent[res.src]; !ok {
-				peerPresent[res.src] = true
-				c.addDerpPeerRoute(res.src, regionID, dc)
+			if res.src != lastPacketSrc { // avoid map lookup w/ high throughput single peer
+				lastPacketSrc = res.src
+				if _, ok := peerPresent[res.src]; !ok {
+					peerPresent[res.src] = true
+					c.addDerpPeerRoute(res.src, regionID, dc)
+				}
 			}
 		case derp.PingMessage:
 			// Best effort reply to the ping.
@@ -1573,6 +1589,8 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 			continue
 		case derp.HealthMessage:
 			health.SetDERPRegionHealth(regionID, m.Problem)
+		case derp.PeerGoneMessage:
+			c.removeDerpPeerRoute(key.NodePublic(m), regionID, dc)
 		default:
 			// Ignore.
 			continue
@@ -2252,6 +2270,7 @@ func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
 		return
 	}
 
+	c.derpMapAtomic.Store(dm)
 	old := c.derpMap
 	c.derpMap = dm
 	if dm == nil {
@@ -2629,6 +2648,7 @@ func (c *connBind) Close() error {
 	}
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
+	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
 	c.derpRecvCh <- derpReadResult{}
 	return nil
 }

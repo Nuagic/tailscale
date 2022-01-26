@@ -2,12 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package noise implements the base transport of the Tailscale 2021
-// control protocol.
+// Package controlbase implements the base transport of the Tailscale
+// 2021 control protocol.
 //
 // The base transport implements Noise IK, instantiated with
 // Curve25519, ChaCha20Poly1305 and BLAKE2s.
-package noise
+package controlbase
 
 import (
 	"crypto/cipher"

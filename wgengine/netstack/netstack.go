@@ -34,13 +34,17 @@ import (
 	"inet.af/netstack/tcpip/transport/tcp"
 	"inet.af/netstack/tcpip/transport/udp"
 	"inet.af/netstack/waiter"
+	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
 	"tailscale.com/syncs"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
@@ -48,7 +52,7 @@ import (
 
 const debugPackets = false
 
-var debugNetstack, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_NETSTACK"))
+var debugNetstack = envknob.Bool("TS_DEBUG_NETSTACK")
 
 // Impl contains the state for the netstack implementation,
 // and implements wgengine.FakeImpl to act as a userspace network
@@ -71,13 +75,16 @@ type Impl struct {
 	// It can only be set before calling Start.
 	ProcessSubnets bool
 
-	ipstack *stack.Stack
-	linkEP  *channel.Endpoint
-	tundev  *tstun.Wrapper
-	e       wgengine.Engine
-	mc      *magicsock.Conn
-	logf    logger.Logf
-	dialer  *tsdial.Dialer
+	ipstack   *stack.Stack
+	linkEP    *channel.Endpoint
+	tundev    *tstun.Wrapper
+	e         wgengine.Engine
+	mc        *magicsock.Conn
+	logf      logger.Logf
+	dialer    *tsdial.Dialer
+	ctx       context.Context    // alive until Close
+	ctxCancel context.CancelFunc // called on Close
+	lb        *ipnlocal.LocalBackend
 
 	// atomicIsLocalIPFunc holds a func that reports whether an IP
 	// is a local (non-subnet) Tailscale IP address of this
@@ -92,6 +99,10 @@ type Impl struct {
 	// closed.
 	connsOpenBySubnetIP map[netaddr.IP]int
 }
+
+// sshDemo is initialized in ssh.go (on Linux only) to register an SSH server
+// handler. See https://github.com/tailscale/tailscale/issues/3802.
+var sshDemo func(*Impl, net.Conn) error
 
 const nicID = 1
 const mtu = 1500
@@ -151,8 +162,20 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 		dialer:              dialer,
 		connsOpenBySubnetIP: make(map[netaddr.IP]int),
 	}
+	ns.ctx, ns.ctxCancel = context.WithCancel(context.Background())
 	ns.atomicIsLocalIPFunc.Store(tsaddr.NewContainsIPFunc(nil))
 	return ns, nil
+}
+
+func (ns *Impl) Close() error {
+	ns.ctxCancel()
+	return nil
+}
+
+// SetLocalBackend sets the LocalBackend; it should only be run before
+// the Start method is called.
+func (ns *Impl) SetLocalBackend(lb *ipnlocal.LocalBackend) {
+	ns.lb = lb
 }
 
 // wrapProtoHandler returns protocol handler h wrapped in a version
@@ -242,8 +265,9 @@ func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 		ap := protocolAddr.AddressWithPrefix
 		ip := netaddrIPFromNetstackIP(ap.Address)
 		if ip == v4broadcast && ap.PrefixLen == 32 {
-			// Don't delete this one later. It seems to be important.
-			// Related to Issue 2642? Likely.
+			// Don't add 255.255.255.255/32 to oldIPs so we don't
+			// delete it later. We didn't install it, so it's not
+			// ours to delete.
 			continue
 		}
 		oldIPs[ap] = true
@@ -254,10 +278,10 @@ func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 	if nm.SelfNode != nil {
 		for _, ipp := range nm.SelfNode.Addresses {
 			isAddr[ipp] = true
+			newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
 		}
 		for _, ipp := range nm.SelfNode.AllowedIPs {
-			local := isAddr[ipp]
-			if local && ns.ProcessLocalIPs || !local && ns.ProcessSubnets {
+			if !isAddr[ipp] && ns.ProcessSubnets {
 				newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
 			}
 		}
@@ -346,8 +370,12 @@ func (ns *Impl) DialContextUDP(ctx context.Context, ipp netaddr.IPPort) (*gonet.
 
 func (ns *Impl) injectOutbound() {
 	for {
-		packetInfo, ok := ns.linkEP.ReadContext(context.Background())
+		packetInfo, ok := ns.linkEP.ReadContext(ns.ctx)
 		if !ok {
+			if ns.ctx.Err() != nil {
+				// Return without logging.
+				return
+			}
 			ns.logf("[v2] ReadContext-for-write = ok=false")
 			continue
 		}
@@ -376,9 +404,16 @@ func (ns *Impl) isLocalIP(ip netaddr.IP) bool {
 	return ns.atomicIsLocalIPFunc.Load().(func(netaddr.IP) bool)(ip)
 }
 
+func (ns *Impl) processSSH() bool {
+	return ns.lb != nil && ns.lb.ShouldRunSSH()
+}
+
 // shouldProcessInbound reports whether an inbound packet should be
 // handled by netstack.
 func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
+	if ns.isInboundTSSH(p) && ns.processSSH() {
+		return true
+	}
 	if !ns.ProcessLocalIPs && !ns.ProcessSubnets {
 		// Fast path for common case (e.g. Linux server in TUN mode) where
 		// netstack isn't used at all; don't even do an isLocalIP lookup.
@@ -394,7 +429,13 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 	return false
 }
 
+// setAmbientCapsRaw is non-nil on Linux for Synology, to run ping with
+// CAP_NET_RAW from tailscaled's binary.
+var setAmbientCapsRaw func(*exec.Cmd)
+
 var userPingSem = syncs.NewSemaphore(20) // 20 child ping processes at once
+
+var isSynology = runtime.GOOS == "linux" && distro.Get() == distro.Synology
 
 // userPing tried to ping dstIP and if it succeeds, injects pingResPkt
 // into the tundev.
@@ -419,6 +460,11 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 	switch runtime.GOOS {
 	case "windows":
 		err = exec.Command("ping", "-n", "1", "-w", "3000", dstIP.String()).Run()
+	case "darwin":
+		// Note: 2000 ms is actually 1 second + 2,000
+		// milliseconds extra for 3 seconds total.
+		// See https://github.com/tailscale/tailscale/pull/3753 for details.
+		err = exec.Command("ping", "-c", "1", "-W", "2000", dstIP.String()).Run()
 	case "android":
 		ping := "/system/bin/ping"
 		if dstIP.Is6() {
@@ -426,11 +472,29 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 		}
 		err = exec.Command(ping, "-c", "1", "-w", "3", dstIP.String()).Run()
 	default:
-		err = exec.Command("ping", "-c", "1", "-W", "3", dstIP.String()).Run()
+		ping := "ping"
+		if isSynology {
+			ping = "/bin/ping"
+		}
+		cmd := exec.Command(ping, "-c", "1", "-W", "3", dstIP.String())
+		if isSynology && os.Getuid() != 0 {
+			// On DSM7 we run as non-root and need to pass
+			// CAP_NET_RAW if our binary has it.
+			setAmbientCapsRaw(cmd)
+		}
+		err = cmd.Run()
 	}
 	d := time.Since(t0)
 	if err != nil {
-		ns.logf("exec ping of %v failed in %v", dstIP, d)
+		if d < time.Second/2 {
+			// If it failed quicker than the 3 second
+			// timeout we gave above (500 ms is a
+			// reasonable threshold), then assume the ping
+			// failed for problems finding/running
+			// ping. We don't want to log if the host is
+			// just down.
+			ns.logf("exec ping of %v failed in %v: %v", dstIP, d, err)
+		}
 		return
 	}
 	if debugNetstack {
@@ -439,6 +503,12 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 	if err := ns.tundev.InjectOutbound(pingResPkt); err != nil {
 		ns.logf("InjectOutbound ping response: %v", err)
 	}
+}
+
+func (ns *Impl) isInboundTSSH(p *packet.Parsed) bool {
+	return p.IPProto == ipproto.TCP &&
+		p.Dst.Port() == 22 &&
+		ns.isLocalIP(p.Dst.IP())
 }
 
 func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
@@ -470,6 +540,7 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 	case 6:
 		pn = header.IPv6ProtocolNumber
 	}
+	p.RemoveECNBits() // Issue 2642
 	if debugPackets {
 		ns.logf("[v2] packet in (from %v): % x", p.Src, p.Buffer())
 	}
@@ -478,6 +549,7 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 		Data: vv,
 	})
 	ns.linkEP.InjectInbound(pn, packetBuf)
+	packetBuf.DecRef()
 
 	// We've now delivered this to netstack, so we're done.
 	// Instead of returning a filter.Accept here (which would also
@@ -508,7 +580,7 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	clientRemoteIP := netaddrIPFromNetstackIP(reqDetails.RemoteAddress)
 	if !clientRemoteIP.IsValid() {
 		ns.logf("invalid RemoteAddress in TCP ForwarderRequest: %s", stringifyTEI(reqDetails))
-		r.Complete(true)
+		r.Complete(true) // sends a RST
 		return
 	}
 
@@ -524,7 +596,8 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		r.Complete(true)
+		ns.logf("CreateEndpoint error for %s: %v", stringifyTEI(reqDetails), err)
+		r.Complete(true) // sends a RST
 		return
 	}
 	r.Complete(false)
@@ -539,6 +612,16 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	// block until the TCP handshake is complete.
 	c := gonet.NewTCPConn(&wq, ep)
 
+	if reqDetails.LocalPort == 22 && ns.processSSH() && ns.isLocalIP(dialIP) && sshDemo != nil {
+		// TODO(bradfitz): un-demo this.
+		ns.logf("doing ssh demo thing....")
+		if err := sshDemo(ns, c); err != nil {
+			ns.logf("ssh demo error: %v", err)
+		} else {
+			ns.logf("ssh demo: ok")
+		}
+		return
+	}
 	if ns.ForwardTCPIn != nil {
 		ns.ForwardTCPIn(c, reqDetails.LocalPort)
 		return

@@ -27,6 +27,7 @@ import (
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -38,6 +39,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
 	"tailscale.com/portlist"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/empty"
@@ -64,7 +66,7 @@ import (
 var controlDebugFlags = getControlDebugFlags()
 
 func getControlDebugFlags() []string {
-	if e := os.Getenv("TS_DEBUG_CONTROL_FLAGS"); e != "" {
+	if e := envknob.String("TS_DEBUG_CONTROL_FLAGS"); e != "" {
 		return strings.Split(e, ",")
 	}
 	return nil
@@ -99,6 +101,7 @@ type LocalBackend struct {
 	serverURL             string           // tailcontrol URL
 	newDecompressor       func() (controlclient.Decompressor, error)
 	varRoot               string // or empty if SetVarRoot never called
+	sshAtomicBool         syncs.AtomicBool
 
 	filterHash deephash.Sum
 
@@ -1349,7 +1352,7 @@ func (b *LocalBackend) popBrowserAuthNow() {
 }
 
 // For testing lazy machine key generation.
-var panicOnMachineKeyGeneration, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_PANIC_MACHINE_KEY"))
+var panicOnMachineKeyGeneration = envknob.Bool("TS_DEBUG_PANIC_MACHINE_KEY")
 
 func (b *LocalBackend) createGetMachinePrivateKeyFunc() func() (key.MachinePrivate, error) {
 	var cache atomic.Value
@@ -1535,6 +1538,9 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 	}
 
 	b.logf("backend prefs for %q: %s", key, b.prefs.Pretty())
+
+	b.sshAtomicBool.Set(b.prefs != nil && b.prefs.RunSSH)
+
 	return nil
 }
 
@@ -1707,6 +1713,8 @@ func (b *LocalBackend) SetPrefs(newp *ipn.Prefs) {
 func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 	netMap := b.netMap
 	stateKey := b.stateKey
+
+	b.sshAtomicBool.Set(newp.RunSSH)
 
 	oldp := b.prefs
 	newp.Persist = oldp.Persist // caller isn't allowed to override this
@@ -2617,7 +2625,10 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	b.authURL = ""
 	b.authURLSticky = ""
 	b.activeLogin = ""
+	b.sshAtomicBool.Set(false)
 }
+
+func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Get() }
 
 // Logout tells the controlclient that we want to log out, and
 // transitions the local engine to the logged-out state without

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package noise
+package controlbase
 
 import (
 	"context"
@@ -29,7 +29,7 @@ func TestInteropClient(t *testing.T) {
 	)
 
 	go func() {
-		server, err := Server(context.Background(), s2, controlKey)
+		server, err := Server(context.Background(), s2, controlKey, nil)
 		serverErr <- err
 		if err != nil {
 			return

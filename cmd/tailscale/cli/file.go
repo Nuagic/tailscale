@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,6 +25,7 @@ import (
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -148,7 +148,7 @@ func runCp(ctx context.Context, args []string) error {
 				name = filepath.Base(fileArg)
 			}
 
-			if slow, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_SLOW_PUSH")); slow {
+			if envknob.Bool("TS_DEBUG_SLOW_PUSH") {
 				fileContents = &slowReader{r: fileContents}
 			}
 		}
@@ -324,7 +324,7 @@ func runFileGet(ctx context.Context, args []string) error {
 	for {
 		wfs, err = tailscale.WaitingFiles(ctx)
 		if err != nil {
-			return fmt.Errorf("getting WaitingFiles: %v", err)
+			return fmt.Errorf("getting WaitingFiles: %w", err)
 		}
 		if len(wfs) != 0 || !getArgs.wait {
 			break
@@ -379,7 +379,7 @@ func wipeInbox(ctx context.Context) error {
 	}
 	wfs, err := tailscale.WaitingFiles(ctx)
 	if err != nil {
-		return fmt.Errorf("getting WaitingFiles: %v", err)
+		return fmt.Errorf("getting WaitingFiles: %w", err)
 	}
 	deleted := 0
 	for _, wf := range wfs {
