@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go4.org/mem"
@@ -64,6 +65,12 @@ type Client struct {
 	ctx       context.Context // closed via cancelCtx in Client.Close
 	cancelCtx context.CancelFunc
 
+	// addrFamSelAtomic is the last AddressFamilySelector set
+	// by SetAddressFamilySelector. It's an atomic because it needs
+	// to be accessed by multiple racing routines started while
+	// Client.conn holds mu.
+	addrFamSelAtomic atomic.Value // of AddressFamilySelector
+
 	mu           sync.Mutex
 	preferred    bool
 	canAckPings  bool
@@ -72,6 +79,7 @@ type Client struct {
 	client       *derp.Client
 	connGen      int // incremented once per new connection; valid values are >0
 	serverPubKey key.NodePublic
+	tlsState     *tls.ConnectionState
 	pingOut      map[derp.PingMessage]chan<- bool // chan to send to on pong
 }
 
@@ -122,6 +130,17 @@ func NewClient(privateKey key.NodePrivate, serverURL string, logf logger.Logf) (
 func (c *Client) Connect(ctx context.Context) error {
 	_, _, err := c.connect(ctx, "derphttp.Client.Connect")
 	return err
+}
+
+// TLSConnectionState returns the last TLS connection state, if any.
+// The client must already be connected.
+func (c *Client) TLSConnectionState() (_ *tls.ConnectionState, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.client == nil {
+		return nil, false
+	}
+	return c.tlsState, c.tlsState != nil
 }
 
 // ServerPublicKey returns the server's public key.
@@ -179,6 +198,32 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 		return c.url.String()
 	}
 	return fmt.Sprintf("https://%s/derp", node.HostName)
+}
+
+// AddressFamilySelector decides whethers IPv6 is preferred for
+// outbound dials.
+type AddressFamilySelector interface {
+	// PreferIPv6 reports whether IPv4 dials should be slightly
+	// delayed to give IPv6 a better chance of winning dial races.
+	// Implementations should only return true if IPv6 is expected
+	// to succeed. (otherwise delaying IPv4 will delay the
+	// connection overall)
+	PreferIPv6() bool
+}
+
+// SetAddressFamilySelector sets the AddressFamilySelector that this
+// connection will use. It should be called before any dials.
+// The value must not be nil. If called more than once, s must
+// be the same concrete type as any prior calls.
+func (c *Client) SetAddressFamilySelector(s AddressFamilySelector) {
+	c.addrFamSelAtomic.Store(s)
+}
+
+func (c *Client) preferIPv6() bool {
+	if s, ok := c.addrFamSelAtomic.Load().(AddressFamilySelector); ok {
+		return s.PreferIPv6()
+	}
+	return false
 }
 
 // dialWebsocketFunc is non-nil (set by websocket.go's init) when compiled in.
@@ -318,6 +363,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	var httpConn net.Conn        // a TCP conn or a TLS conn; what we speak HTTP to
 	var serverPub key.NodePublic // or zero if unknown (if not using TLS or TLS middlebox eats it)
 	var serverProtoVersion int
+	var tlsState *tls.ConnectionState
 	if c.useHTTPS() {
 		tlsConn := c.tlsClient(tcpConn, node)
 		httpConn = tlsConn
@@ -340,9 +386,10 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		// Note that we're not specifically concerned about TLS downgrade
 		// attacks. TLS handles that fine:
 		// https://blog.gypsyengineer.com/en/security/how-does-tls-1-3-protect-against-downgrade-attacks.html
-		connState := tlsConn.ConnectionState()
-		if connState.Version >= tls.VersionTLS13 {
-			serverPub, serverProtoVersion = parseMetaCert(connState.PeerCertificates)
+		cs := tlsConn.ConnectionState()
+		tlsState = &cs
+		if cs.Version >= tls.VersionTLS13 {
+			serverPub, serverProtoVersion = parseMetaCert(cs.PeerCertificates)
 		}
 	} else {
 		httpConn = tcpConn
@@ -409,6 +456,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	c.serverPubKey = derpClient.ServerPublicKey()
 	c.client = derpClient
 	c.netConn = tcpConn
+	c.tlsState = tlsState
 	c.connGen++
 	return c.client, c.connGen, nil
 }
@@ -568,6 +616,18 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 	startDial := func(dstPrimary, proto string) {
 		nwait++
 		go func() {
+			if proto == "tcp4" && c.preferIPv6() {
+				t := time.NewTimer(200 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					// Either user canceled original context,
+					// it timed out, or the v6 dial succeeded.
+					t.Stop()
+					return
+				case <-t.C:
+					// Start v4 dial
+				}
+			}
 			dst := dstPrimary
 			if dst == "" {
 				dst = n.HostName
