@@ -278,53 +278,160 @@ type DialContextFunc func(ctx context.Context, network, address string) (net.Con
 
 // Dialer returns a wrapped DialContext func that uses the provided dnsCache.
 func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
-	return func(ctx context.Context, network, address string) (retConn net.Conn, ret error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			// Bogus. But just let the real dialer return an error rather than
-			// inventing a similar one.
-			return fwd(ctx, network, address)
-		}
-		defer func() {
-			// On any failure, assume our DNS is wrong and try our fallback, if any.
-			if ret == nil || dnsCache.LookupIPFallback == nil {
-				return
-			}
-			ips, err := dnsCache.LookupIPFallback(ctx, host)
-			if err != nil {
-				// Return with original error
-				return
-			}
-			if c, err := raceDial(ctx, fwd, network, ips, port); err == nil {
-				retConn = c
-				ret = nil
-				return
-			}
-		}()
-
-		ip, ip6, allIPs, err := dnsCache.LookupIP(ctx, host)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve %q: %w", host, err)
-		}
-		i4s := v4addrs(allIPs)
-		if len(i4s) < 2 {
-			dst := net.JoinHostPort(ip.String(), port)
-			if debug {
-				log.Printf("dnscache: dialing %s, %s for %s", network, dst, address)
-			}
-			c, err := fwd(ctx, network, dst)
-			if err == nil || ctx.Err() != nil || ip6 == nil {
-				return c, err
-			}
-			// Fall back to trying IPv6.
-			dst = net.JoinHostPort(ip6.String(), port)
-			return fwd(ctx, network, dst)
-		}
-
-		// Multiple IPv4 candidates, and 0+ IPv6.
-		ipsToTry := append(i4s, v6addrs(allIPs)...)
-		return raceDial(ctx, fwd, network, ipsToTry, port)
+	d := &dialer{
+		fwd:         fwd,
+		dnsCache:    dnsCache,
+		pastConnect: map[netaddr.IP]time.Time{},
 	}
+	return d.DialContext
+}
+
+// dialer is the config and accumulated state for a dial func returned by Dialer.
+type dialer struct {
+	fwd      DialContextFunc
+	dnsCache *Resolver
+
+	mu          sync.Mutex
+	pastConnect map[netaddr.IP]time.Time
+}
+
+func (d *dialer) DialContext(ctx context.Context, network, address string) (retConn net.Conn, ret error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		// Bogus. But just let the real dialer return an error rather than
+		// inventing a similar one.
+		return d.fwd(ctx, network, address)
+	}
+	dc := &dialCall{
+		d:       d,
+		network: network,
+		address: address,
+		host:    host,
+		port:    port,
+	}
+	defer func() {
+		// On failure, consider that our DNS might be wrong and ask the DNS fallback mechanism for
+		// some other IPs to try.
+		if ret == nil || d.dnsCache.LookupIPFallback == nil || dc.dnsWasTrustworthy() {
+			return
+		}
+		ips, err := d.dnsCache.LookupIPFallback(ctx, host)
+		if err != nil {
+			// Return with original error
+			return
+		}
+		if c, err := dc.raceDial(ctx, ips); err == nil {
+			retConn = c
+			ret = nil
+			return
+		}
+	}()
+
+	ip, ip6, allIPs, err := d.dnsCache.LookupIP(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve %q: %w", host, err)
+	}
+	i4s := v4addrs(allIPs)
+	if len(i4s) < 2 {
+		if debug {
+			log.Printf("dnscache: dialing %s, %s for %s", network, ip, address)
+		}
+		ipNA, ok := netaddr.FromStdIP(ip)
+		if !ok {
+			return nil, fmt.Errorf("invalid IP %q", ip)
+		}
+		c, err := dc.dialOne(ctx, ipNA)
+		if err == nil || ctx.Err() != nil {
+			return c, err
+		}
+		// Fall back to trying IPv6, if any.
+		ip6NA, ok := netaddr.FromStdIP(ip6)
+		if !ok {
+			return nil, err
+		}
+		return dc.dialOne(ctx, ip6NA)
+	}
+
+	// Multiple IPv4 candidates, and 0+ IPv6.
+	ipsToTry := append(i4s, v6addrs(allIPs)...)
+	return dc.raceDial(ctx, ipsToTry)
+}
+
+// dialCall is the state around a single call to dial.
+type dialCall struct {
+	d                            *dialer
+	network, address, host, port string
+
+	mu    sync.Mutex           // lock ordering: dialer.mu, then dialCall.mu
+	fails map[netaddr.IP]error // set of IPs that failed to dial thus far
+}
+
+// dnsWasTrustworthy reports whether we think the IP address(es) we
+// tried (and failed) to dial were probably the correct IPs. Currently
+// the heuristic is whether they ever worked previously.
+func (dc *dialCall) dnsWasTrustworthy() bool {
+	dc.d.mu.Lock()
+	defer dc.d.mu.Unlock()
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if len(dc.fails) == 0 {
+		// No information.
+		return false
+	}
+
+	// If any of the IPs we failed to dial worked previously in
+	// this dialer, assume the DNS is fine.
+	for ip := range dc.fails {
+		if _, ok := dc.d.pastConnect[ip]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (dc *dialCall) dialOne(ctx context.Context, ip netaddr.IP) (net.Conn, error) {
+	c, err := dc.d.fwd(ctx, dc.network, net.JoinHostPort(ip.String(), dc.port))
+	dc.noteDialResult(ip, err)
+	return c, err
+}
+
+// noteDialResult records that a dial to ip either succeeded or
+// failed.
+func (dc *dialCall) noteDialResult(ip netaddr.IP, err error) {
+	if err == nil {
+		d := dc.d
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.pastConnect[ip] = time.Now()
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.fails == nil {
+		dc.fails = map[netaddr.IP]error{}
+	}
+	dc.fails[ip] = err
+}
+
+// uniqueIPs returns a possibly-mutated subslice of ips, filtering out
+// dups and ones that have already failed previously.
+func (dc *dialCall) uniqueIPs(ips []netaddr.IP) (ret []netaddr.IP) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	seen := map[netaddr.IP]bool{}
+	ret = ips[:0]
+	for _, ip := range ips {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if dc.fails[ip] != nil {
+			continue
+		}
+		ret = append(ret, ip)
+	}
+	return ret
 }
 
 // fallbackDelay is how long to wait between trying subsequent
@@ -334,7 +441,7 @@ const fallbackDelay = 300 * time.Millisecond
 
 // raceDial tries to dial port on each ip in ips, starting a new race
 // dial every fallbackDelay apart, returning whichever completes first.
-func raceDial(ctx context.Context, fwd DialContextFunc, network string, ips []netaddr.IP, port string) (net.Conn, error) {
+func (dc *dialCall) raceDial(ctx context.Context, ips []netaddr.IP) (net.Conn, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -344,6 +451,14 @@ func raceDial(ctx context.Context, fwd DialContextFunc, network string, ips []ne
 	}
 	resc := make(chan res)           // must be unbuffered
 	failBoost := make(chan struct{}) // best effort send on dial failure
+
+	// Remove IPs that we tried & failed to dial previously
+	// (such as when we're being called after a dnsfallback lookup and get
+	// the same results)
+	ips = dc.uniqueIPs(ips)
+	if len(ips) == 0 {
+		return nil, errors.New("no IPs")
+	}
 
 	go func() {
 		for i, ip := range ips {
@@ -359,7 +474,7 @@ func raceDial(ctx context.Context, fwd DialContextFunc, network string, ips []ne
 				}
 			}
 			go func(ip netaddr.IP) {
-				c, err := fwd(ctx, network, net.JoinHostPort(ip.String(), port))
+				c, err := dc.dialOne(ctx, ip)
 				if err != nil {
 					// Best effort wake-up a pending dial.
 					// e.g. IPv4 dials failing quickly on an IPv6-only system.
