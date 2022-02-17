@@ -474,7 +474,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		MachineAuthorized: machineAuthorized,
 		Addresses:         allowedIPs,
 		AllowedIPs:        allowedIPs,
-		Hostinfo:          *req.Hostinfo,
+		Hostinfo:          req.Hostinfo.View(),
 	}
 	requireAuth := s.RequireAuth
 	if requireAuth && s.nodeKeyAuthed[nk] {
@@ -611,10 +611,10 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		node.Endpoints = endpoints
 		node.DiscoKey = req.DiscoKey
 		if req.Hostinfo != nil {
-			node.Hostinfo = *req.Hostinfo.Clone()
-			if ni := node.Hostinfo.NetInfo; ni != nil {
-				if ni.PreferredDERP != 0 {
-					node.DERP = fmt.Sprintf("127.3.3.40:%d", ni.PreferredDERP)
+			node.Hostinfo = req.Hostinfo.View()
+			if ni := node.Hostinfo.NetInfo(); ni.Valid() {
+				if ni.PreferredDERP() != 0 {
+					node.DERP = fmt.Sprintf("127.3.3.40:%d", ni.PreferredDERP())
 				}
 			}
 		}
@@ -730,7 +730,8 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		Debug: &tailcfg.Debug{
 			DisableUPnP: "true",
 		},
-		DNSConfig: s.DNSConfig,
+		DNSConfig:   s.DNSConfig,
+		ControlTime: time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC),
 	}
 	for _, p := range s.AllNodes() {
 		if p.StableID != node.StableID {
