@@ -454,6 +454,7 @@ type Hostinfo struct {
 	RequestTags   []string           `json:",omitempty"` // set of ACL tags this node wants to claim
 	Services      []Service          `json:",omitempty"` // services advertised by this machine
 	NetInfo       *NetInfo           `json:",omitempty"`
+	SSH_HostKeys  []string           `json:"sshHostKeys,omitempty"` // if advertised
 
 	// NOTE: any new fields containing pointers in this type
 	//       require changes to Hostinfo.Equal.
@@ -514,6 +515,10 @@ func (v HostinfoView) RoutableIPs() views.IPPrefixSlice {
 
 func (v HostinfoView) RequestTags() views.StringSlice {
 	return views.StringSliceOf(v.ж.RequestTags)
+}
+
+func (v HostinfoView) SSH_HostKeys() views.StringSlice {
+	return views.StringSliceOf(v.ж.SSH_HostKeys)
 }
 
 func (v HostinfoView) Services() ServiceSlice {
@@ -1195,7 +1200,7 @@ type PingRequest struct {
 type MapResponse struct {
 	// KeepAlive, if set, represents an empty message just to keep
 	// the connection alive. When true, all other fields except
-	// PingRequestURL are ignored.
+	// PingRequest are ignored.
 	KeepAlive bool `json:",omitempty"`
 
 	// PingRequest, if non-empty, is a request to the client to
