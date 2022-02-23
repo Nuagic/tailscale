@@ -6,14 +6,18 @@ package hostinfo
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"tailscale.com/util/winutil"
 )
 
 func init() {
 	osVersion = osVersionWindows
+	packageType = packageTypeWindows
 }
 
 var winVerCache atomic.Value // of string
@@ -55,4 +59,26 @@ func getUBR() (uint32, error) {
 	}
 
 	return uint32(val), nil
+}
+
+func packageTypeWindows() string {
+	if _, err := os.Stat(`C:\ProgramData\chocolatey\lib\tailscale`); err == nil {
+		return "choco"
+	}
+	if msiSentinel := winutil.GetRegInteger("MSI", 0); msiSentinel == 1 {
+		return "msi"
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	nsisUninstaller := filepath.Join(dir, "Uninstall-Tailscale.exe")
+	_, err = os.Stat(nsisUninstaller)
+	if err == nil {
+		return "nsis"
+	}
+	// Atypical. Not worth trying to detect. Likely open
+	// source tailscaled or a developer running by hand.
+	return ""
 }
