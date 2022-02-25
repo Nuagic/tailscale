@@ -2,13 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
-// +build linux
+//go:build linux || (darwin && !ios)
+// +build linux darwin,!ios
 
 // Package tailssh is an SSH server integrated into Tailscale.
 package tailssh
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"inet.af/netaddr"
+	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/tsaddr"
@@ -33,38 +35,54 @@ import (
 	"tailscale.com/types/logger"
 )
 
+func init() {
+	childproc.Add("ssh", sshChild)
+}
+
+func sshChild([]string) error {
+	fmt.Println("TODO(maisem): ssh dbus stuff")
+	return nil
+}
+
 // TODO(bradfitz): this is all very temporary as code is temporarily
 // being moved around; it will be restructured and documented in
 // following commits.
 
 // Handle handles an SSH connection from c.
 func Handle(logf logger.Logf, lb *ipnlocal.LocalBackend, c net.Conn) error {
-	sshd := &server{lb, logf}
-	srv := &ssh.Server{
-		Handler:           sshd.handleSSH,
+	srv := &server{lb, logf}
+	ss, err := srv.newSSHServer()
+	if err != nil {
+		return err
+	}
+	ss.HandleConn(c)
+	return nil
+}
+
+func (srv *server) newSSHServer() (*ssh.Server, error) {
+	ss := &ssh.Server{
+		Handler:           srv.handleSSH,
 		RequestHandlers:   map[string]ssh.RequestHandler{},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
 		ChannelHandlers:   map[string]ssh.ChannelHandler{},
 	}
 	for k, v := range ssh.DefaultRequestHandlers {
-		srv.RequestHandlers[k] = v
+		ss.RequestHandlers[k] = v
 	}
 	for k, v := range ssh.DefaultChannelHandlers {
-		srv.ChannelHandlers[k] = v
+		ss.ChannelHandlers[k] = v
 	}
 	for k, v := range ssh.DefaultSubsystemHandlers {
-		srv.SubsystemHandlers[k] = v
+		ss.SubsystemHandlers[k] = v
 	}
-	keys, err := lb.GetSSH_HostKeys()
+	keys, err := srv.lb.GetSSH_HostKeys()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, signer := range keys {
-		srv.AddHostKey(signer)
+		ss.AddHostKey(signer)
 	}
-
-	srv.HandleConn(c)
-	return nil
+	return ss, nil
 }
 
 type server struct {
@@ -102,7 +120,6 @@ func (srv *server) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
 func (srv *server) handleSSH(s ssh.Session) {
 	lb := srv.lb
 	logf := srv.logf
-
 	sshUser := s.User()
 	addr := s.RemoteAddr()
 	logf("Handling SSH from %v for user %v", addr, sshUser)
@@ -131,7 +148,6 @@ func (srv *server) handleSSH(s ssh.Session) {
 		return
 	}
 
-	ptyReq, winCh, isPty := s.Pty()
 	srcIPP := netaddr.IPPortFrom(tanetaddr, uint16(ta.Port))
 	node, uprof, ok := lb.WhoIs(srcIPP)
 	if !ok {
@@ -141,14 +157,14 @@ func (srv *server) handleSSH(s ssh.Session) {
 	}
 
 	srcIP := srcIPP.IP()
-	sctx := &sshContext{
+	ci := &sshConnInfo{
 		now:     time.Now(),
 		sshUser: sshUser,
 		srcIP:   srcIP,
 		node:    node,
 		uprof:   &uprof,
 	}
-	action, localUser, ok := evalSSHPolicy(pol, sctx)
+	action, localUser, ok := evalSSHPolicy(pol, ci)
 	if ok && action.Message != "" {
 		io.WriteString(s.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
 	}
@@ -167,7 +183,34 @@ func (srv *server) handleSSH(s ssh.Session) {
 		s.Exit(1)
 	}
 
-	logf("ssh: connection from %v %v to %v@ => %q. command = %q, env = %q", srcIP, uprof.LoginName, sshUser, localUser, s.Command(), s.Environ())
+	var ctx context.Context = context.Background()
+	if action.SesssionDuration != 0 {
+		sctx := newSSHContext()
+		ctx = sctx
+		t := time.AfterFunc(action.SesssionDuration, func() {
+			sctx.CloseWithError(userVisibleError{
+				fmt.Sprintf("Session timeout of %v elapsed.", action.SesssionDuration),
+				context.DeadlineExceeded,
+			})
+		})
+		defer t.Stop()
+	}
+	srv.handleAcceptedSSH(ctx, s, ci, lu)
+}
+
+// handleAcceptedSSH handles s once it's been accepted and determined
+// that it should run as local system user lu.
+//
+// When ctx is done, the session is forcefully terminated. If its Err
+// is an SSHTerminationError, its SSHTerminationMessage is sent to the
+// user.
+func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *sshConnInfo, lu *user.User) {
+	logf := srv.logf
+	localUser := lu.Username
+
+	var err error
+	ptyReq, winCh, isPty := s.Pty()
+	logf("ssh: connection from %v %v to %v@ => %q. command = %q, env = %q", ci.srcIP, ci.uprof.LoginName, ci.sshUser, localUser, s.Command(), s.Environ())
 	var cmd *exec.Cmd
 	if euid := os.Geteuid(); euid != 0 {
 		if lu.Uid != fmt.Sprint(euid) {
@@ -177,20 +220,23 @@ func (srv *server) handleSSH(s ssh.Session) {
 			return
 		}
 		cmd = exec.Command(loginShell(lu.Uid))
+		if rawCmd := s.RawCommand(); rawCmd != "" {
+			cmd.Args = append(cmd.Args, "-c", rawCmd)
+		}
 	} else {
 		if rawCmd := s.RawCommand(); rawCmd != "" {
 			cmd = exec.Command("/usr/bin/env", "su", "-c", rawCmd, localUser)
-			cmd.Dir = lu.HomeDir
-			cmd.Env = append(cmd.Env, envForUser(lu)...)
 			// TODO: and Env for PATH, SSH_CONNECTION, SSH_CLIENT, XDG_SESSION_TYPE, XDG_*, etc
 		} else {
 			cmd = exec.Command("/usr/bin/env", "su", "-", localUser)
 		}
 	}
+	cmd.Dir = lu.HomeDir
+	cmd.Env = append(cmd.Env, s.Environ()...)
+	cmd.Env = append(cmd.Env, envForUser(lu)...)
 	if ptyReq.Term != "" {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
 	}
-	// TODO(bradfitz,maisem): also blend in user's s.Environ()
 	logf("Running: %q", cmd.Args)
 	var toCmd io.WriteCloser
 	var fromCmd io.ReadCloser
@@ -223,12 +269,24 @@ func (srv *server) handleSSH(s ssh.Session) {
 		go func() { io.Copy(s.Stderr(), stderr) }()
 	}
 
-	if action.SesssionDuration != 0 {
-		t := time.AfterFunc(action.SesssionDuration, func() {
-			logf("terminating SSH session from %v after max duration", srcIP)
-			cmd.Process.Kill()
-		})
-		defer t.Stop()
+	if ctx.Done() != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				err := ctx.Err()
+				if serr, ok := err.(SSHTerminationError); ok {
+					msg := serr.SSHTerminationMessage()
+					if msg != "" {
+						io.WriteString(s.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
+					}
+				}
+				logf("terminating SSH session from %v: %v", ci.srcIP, err)
+				cmd.Process.Kill()
+			}
+		}()
 	}
 
 	go func() {
@@ -264,7 +322,7 @@ func setWinsize(f *os.File, w, h int) {
 		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
 }
 
-type sshContext struct {
+type sshConnInfo struct {
 	// now is the time to consider the present moment for the
 	// purposes of rule evaluation.
 	now time.Time
@@ -282,9 +340,9 @@ type sshContext struct {
 	uprof *tailcfg.UserProfile
 }
 
-func evalSSHPolicy(pol *tailcfg.SSHPolicy, sctx *sshContext) (a *tailcfg.SSHAction, localUser string, ok bool) {
+func evalSSHPolicy(pol *tailcfg.SSHPolicy, ci *sshConnInfo) (a *tailcfg.SSHAction, localUser string, ok bool) {
 	for _, r := range pol.Rules {
-		if a, localUser, err := matchRule(r, sctx); err == nil {
+		if a, localUser, err := matchRule(r, ci); err == nil {
 			return a, localUser, true
 		}
 	}
@@ -300,21 +358,21 @@ var (
 	errUserMatch      = errors.New("user didn't match")
 )
 
-func matchRule(r *tailcfg.SSHRule, sctx *sshContext) (a *tailcfg.SSHAction, localUser string, err error) {
+func matchRule(r *tailcfg.SSHRule, ci *sshConnInfo) (a *tailcfg.SSHAction, localUser string, err error) {
 	if r == nil {
 		return nil, "", errNilRule
 	}
 	if r.Action == nil {
 		return nil, "", errNilAction
 	}
-	if r.RuleExpires != nil && sctx.now.After(*r.RuleExpires) {
+	if r.RuleExpires != nil && ci.now.After(*r.RuleExpires) {
 		return nil, "", errRuleExpired
 	}
-	if !matchesPrincipal(r.Principals, sctx) {
+	if !matchesPrincipal(r.Principals, ci) {
 		return nil, "", errPrincipalMatch
 	}
 	if !r.Action.Reject || r.SSHUsers != nil {
-		localUser = mapLocalUser(r.SSHUsers, sctx.sshUser)
+		localUser = mapLocalUser(r.SSHUsers, ci.sshUser)
 		if localUser == "" {
 			return nil, "", errUserMatch
 		}
@@ -329,7 +387,7 @@ func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser 
 	return ruleSSHUsers["*"]
 }
 
-func matchesPrincipal(ps []*tailcfg.SSHPrincipal, sctx *sshContext) bool {
+func matchesPrincipal(ps []*tailcfg.SSHPrincipal, ci *sshConnInfo) bool {
 	for _, p := range ps {
 		if p == nil {
 			continue
@@ -337,15 +395,15 @@ func matchesPrincipal(ps []*tailcfg.SSHPrincipal, sctx *sshContext) bool {
 		if p.Any {
 			return true
 		}
-		if !p.Node.IsZero() && sctx.node != nil && p.Node == sctx.node.StableID {
+		if !p.Node.IsZero() && ci.node != nil && p.Node == ci.node.StableID {
 			return true
 		}
 		if p.NodeIP != "" {
-			if ip, _ := netaddr.ParseIP(p.NodeIP); ip == sctx.srcIP {
+			if ip, _ := netaddr.ParseIP(p.NodeIP); ip == ci.srcIP {
 				return true
 			}
 		}
-		if p.UserLogin != "" && sctx.uprof != nil && sctx.uprof.LoginName == p.UserLogin {
+		if p.UserLogin != "" && ci.uprof != nil && ci.uprof.LoginName == p.UserLogin {
 			return true
 		}
 	}
@@ -359,7 +417,7 @@ func loginShell(uid string) string {
 		// out is "root:x:0:0:root:/root:/bin/bash"
 		f := strings.SplitN(string(out), ":", 10)
 		if len(f) > 6 {
-			return f[6] // shell
+			return strings.TrimSpace(f[6]) // shell
 		}
 	}
 	if e := os.Getenv("SHELL"); e != "" {
