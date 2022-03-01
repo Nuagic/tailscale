@@ -1,24 +1,84 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
+// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package ipn
+package store
 
 import (
 	"path/filepath"
 	"testing"
 
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tstest"
+	"tailscale.com/types/logger"
 )
 
-func testStoreSemantics(t *testing.T, store StateStore) {
+func TestNewStore(t *testing.T) {
+	regOnce.Do(registerDefaultStores)
+	t.Cleanup(func() {
+		knownStores = map[string]Provider{}
+		registerDefaultStores()
+	})
+	knownStores = map[string]Provider{}
+
+	type store1 struct {
+		ipn.StateStore
+		path string
+	}
+
+	type store2 struct {
+		ipn.StateStore
+		path string
+	}
+
+	Register("arn:", func(_ logger.Logf, path string) (ipn.StateStore, error) {
+		return &store1{new(mem.Store), path}, nil
+	})
+	Register("kube:", func(_ logger.Logf, path string) (ipn.StateStore, error) {
+		return &store2{new(mem.Store), path}, nil
+	})
+	Register("mem:", func(_ logger.Logf, path string) (ipn.StateStore, error) {
+		return new(mem.Store), nil
+	})
+
+	path := "mem:abcd"
+	if s, err := New(t.Logf, path); err != nil {
+		t.Fatalf("%q: %v", path, err)
+	} else if _, ok := s.(*mem.Store); !ok {
+		t.Fatalf("%q: got: %T, want: %T", path, s, new(mem.Store))
+	}
+
+	path = "arn:foo"
+	if s, err := New(t.Logf, path); err != nil {
+		t.Fatalf("%q: %v", path, err)
+	} else if _, ok := s.(*store1); !ok {
+		t.Fatalf("%q: got: %T, want: %T", path, s, new(store1))
+	}
+
+	path = "kube:abcd"
+	if s, err := New(t.Logf, path); err != nil {
+		t.Fatalf("%q: %v", path, err)
+	} else if _, ok := s.(*store2); !ok {
+		t.Fatalf("%q: got: %T, want: %T", path, s, new(store2))
+	}
+
+	path = filepath.Join(t.TempDir(), "state")
+	if s, err := New(t.Logf, path); err != nil {
+		t.Fatalf("%q: %v", path, err)
+	} else if _, ok := s.(*FileStore); !ok {
+		t.Fatalf("%q: got: %T, want: %T", path, s, new(FileStore))
+	}
+}
+
+func testStoreSemantics(t *testing.T, store ipn.StateStore) {
 	t.Helper()
 
 	tests := []struct {
 		// if true, data is data to write. If false, data is expected
 		// output of read.
 		write bool
-		id    StateKey
+		id    ipn.StateKey
 		data  string
 		// If write=false, true if we expect a not-exist error.
 		notExists bool
@@ -63,7 +123,7 @@ func testStoreSemantics(t *testing.T, store StateStore) {
 		} else {
 			bs, err := store.ReadState(test.id)
 			if err != nil {
-				if test.notExists && err == ErrStateNotExist {
+				if test.notExists && err == ipn.ErrStateNotExist {
 					continue
 				}
 				t.Errorf("reading %q: %v", test.id, err)
@@ -79,7 +139,7 @@ func testStoreSemantics(t *testing.T, store StateStore) {
 func TestMemoryStore(t *testing.T) {
 	tstest.PanicOnLog()
 
-	store := &MemoryStore{}
+	store := new(mem.Store)
 	testStoreSemantics(t, store)
 }
 
@@ -89,7 +149,7 @@ func TestFileStore(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test-file-store.conf")
 
-	store, err := NewFileStore(path)
+	store, err := NewFileStore(nil, path)
 	if err != nil {
 		t.Fatalf("creating file store failed: %v", err)
 	}
@@ -98,12 +158,12 @@ func TestFileStore(t *testing.T) {
 
 	// Build a brand new file store and check that both IDs written
 	// above are still there.
-	store, err = NewFileStore(path)
+	store, err = NewFileStore(nil, path)
 	if err != nil {
 		t.Fatalf("creating second file store failed: %v", err)
 	}
 
-	expected := map[StateKey]string{
+	expected := map[ipn.StateKey]string{
 		"foo": "bar",
 		"baz": "quux",
 	}
