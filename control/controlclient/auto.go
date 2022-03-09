@@ -677,6 +677,7 @@ func (c *Auto) Shutdown() {
 	c.mu.Lock()
 	inSendStatus := c.inSendStatus
 	closed := c.closed
+	direct := c.direct
 	if !closed {
 		c.closed = true
 		c.statusFunc = nil
@@ -691,6 +692,9 @@ func (c *Auto) Shutdown() {
 		<-c.authDone
 		c.cancelMapUnsafely()
 		<-c.mapDone
+		if direct != nil {
+			direct.Close()
+		}
 		c.logf("Client.Shutdown done.")
 	}
 }
