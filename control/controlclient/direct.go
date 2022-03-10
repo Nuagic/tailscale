@@ -302,12 +302,27 @@ func (c *Direct) doLoginOrRegen(ctx context.Context, opt loginOpt) (newURL strin
 	return url, err
 }
 
+// SetExpirySooner attempts to shorten the expiry to the specified time.
+func (c *Direct) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	c.logf("[v1] direct.SetExpirySooner()")
+
+	newURL, err := c.doLoginOrRegen(ctx, loginOpt{Expiry: &expiry})
+	c.logf("[v1] SetExpirySooner control response: newURL=%v, err=%v", newURL, err)
+
+	return err
+}
+
 type loginOpt struct {
 	Token  *tailcfg.Oauth2Token
 	Flags  LoginFlags
-	Regen  bool
+	Regen  bool // generate a new nodekey, can be overridden in doLogin
 	URL    string
-	Logout bool
+	Logout bool // set the expiry to the far past, expiring the node
+	// Expiry, if non-nil, attempts to set the node expiry to the
+	// specified time and cannot be used to extend the expiry.
+	// It is ignored if Logout is set since Logout works by setting a
+	// expiry time in the far past.
+	Expiry *time.Time
 }
 
 // httpClient provides a common interface for the noiseClient and
@@ -406,6 +421,8 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	}
 	if opt.Logout {
 		request.Expiry = time.Unix(123, 0) // far in the past
+	} else if opt.Expiry != nil {
+		request.Expiry = *opt.Expiry
 	}
 	c.logf("RegisterReq: onode=%v node=%v fup=%v",
 		request.OldNodeKey.ShortString(),
@@ -614,6 +631,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	persist := c.persist
 	serverURL := c.serverURL
 	serverKey := c.serverKey
+	serverNoiseKey := c.serverNoiseKey
 	hi := c.hostinfo.Clone()
 	backendLogID := hi.BackendLogID
 	localPort := c.localPort
@@ -696,9 +714,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		request.ReadOnly = true
 	}
 
-	// TODO(maisem/bradfitz): use Noise for map requests.
-	// Currently we pass an empty key to encode so that it doesn't encode for noise.
-	var serverNoiseKey key.MachinePublic
 	bodyData, err := encode(request, serverKey, serverNoiseKey, machinePrivKey)
 	if err != nil {
 		vlogf("netmap: encode: %v", err)
@@ -710,14 +725,28 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 
 	machinePubKey := machinePrivKey.Public()
 	t0 := time.Now()
-	u := fmt.Sprintf("%s/machine/%s/map", serverURL, machinePubKey.UntypedHexString())
 
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(bodyData))
+	// Url and httpc are protocol specific.
+	var url string
+	var httpc httpClient
+	if serverNoiseKey.IsZero() {
+		httpc = c.httpc
+		url = fmt.Sprintf("%s/machine/%s/map", serverURL, machinePubKey.UntypedHexString())
+	} else {
+		httpc, err = c.getNoiseClient()
+		if err != nil {
+			return fmt.Errorf("getNoiseClient: %w", err)
+		}
+		url = fmt.Sprintf("%s/machine/map", serverURL)
+		url = strings.Replace(url, "http:", "https:", 1)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyData))
 	if err != nil {
 		return err
 	}
 
-	res, err := c.httpc.Do(req)
+	res, err := httpc.Do(req)
 	if err != nil {
 		vlogf("netmap: Do: %v", err)
 		return err
@@ -930,14 +959,24 @@ var (
 
 var jsonEscapedZero = []byte(`\u0000`)
 
-func (c *Direct) decodeMsg(msg []byte, v interface{}, machinePrivKey key.MachinePrivate) error {
+// decodeMsg is responsible for uncompressing msg and unmarshaling into v.
+// If c.serverNoiseKey is not specified, it uses the c.serverKey and mkey
+// to first the decrypt msg from the NaCl-crypto-box.
+func (c *Direct) decodeMsg(msg []byte, v interface{}, mkey key.MachinePrivate) error {
 	c.mu.Lock()
 	serverKey := c.serverKey
+	serverNoiseKey := c.serverNoiseKey
 	c.mu.Unlock()
 
-	decrypted, ok := machinePrivKey.OpenFrom(serverKey, msg)
-	if !ok {
-		return errors.New("cannot decrypt response")
+	var decrypted []byte
+	if serverNoiseKey.IsZero() {
+		var ok bool
+		decrypted, ok = mkey.OpenFrom(serverKey, msg)
+		if !ok {
+			return errors.New("cannot decrypt response")
+		}
+	} else {
+		decrypted = msg
 	}
 	var b []byte
 	if c.newDecompressor == nil {

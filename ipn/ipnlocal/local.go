@@ -1543,23 +1543,16 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 		return fmt.Errorf("PrefsFromBytes: %v", err)
 	}
 
-	// On mobile platforms, ignore any old stored preferences for
-	// https://login.tailscale.com as the control server that
-	// would override the new default of controlplane.tailscale.com.
+	// Ignore any old stored preferences for https://login.tailscale.com
+	// as the control server that would override the new default of
+	// controlplane.tailscale.com.
 	// This makes sure that mobile clients go through the new
 	// frontends where we're (2021-10-02) doing battery
 	// optimization work ahead of turning down the old backends.
-	// TODO(bradfitz): make this the default for all platforms
-	// later. But mobile is a relatively small chunk (compared to
-	// Linux, Windows, macOS) and moving mobile early for battery
-	// gains is nice.
-	switch runtime.GOOS {
-	case "android", "ios":
-		if b.prefs != nil && b.prefs.ControlURL != "" &&
-			b.prefs.ControlURL != ipn.DefaultControlURL &&
-			ipn.IsLoginServerSynonym(b.prefs.ControlURL) {
-			b.prefs.ControlURL = ""
-		}
+	if b.prefs != nil && b.prefs.ControlURL != "" &&
+		b.prefs.ControlURL != ipn.DefaultControlURL &&
+		ipn.IsLoginServerSynonym(b.prefs.ControlURL) {
+		b.prefs.ControlURL = ""
 	}
 
 	b.logf("using backend prefs for %q: %s", key, b.prefs.Pretty())
@@ -3185,6 +3178,15 @@ func (b *LocalBackend) allowExitNodeDNSProxyToServeName(name string) bool {
 		}
 	}
 	return true
+}
+
+// SetExpiry updates the expiry of the current node key to t, as long as it's
+// only sooner than the old expiry.
+//
+// If t is in the past, the key is expired immediately.
+// If t is after the current expiry, an error is returned.
+func (b *LocalBackend) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	return b.cc.SetExpirySooner(ctx, expiry)
 }
 
 // exitNodeCanProxyDNS reports the DoH base URL ("http://foo/dns-query") without query parameters
