@@ -380,6 +380,14 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		c.mu.Unlock()
 		serverKey = keys.LegacyPublicKey
 		serverNoiseKey = keys.PublicKey
+
+		// For servers supporting the Noise transport,
+		// proactively shut down our TLS TCP connection.
+		// We're not going to need it and it's nicer to the
+		// server.
+		if !serverNoiseKey.IsZero() {
+			c.httpc.CloseIdleConnections()
+		}
 	}
 	var oldNodeKey key.NodePublic
 	switch {
@@ -1418,6 +1426,14 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 	}
 
 	return nil
+}
+
+func (c *Direct) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	nc, err := c.getNoiseClient()
+	if err != nil {
+		return nil, err
+	}
+	return nc.Do(req)
 }
 
 // tsmpPing sends a Ping to pr.IP, and sends an http request back to pr.URL
