@@ -22,13 +22,15 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
-	"github.com/gliderlabs/ssh"
+	"github.com/tailscale/ssh"
 	"github.com/u-root/u-root/pkg/termios"
+	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/types/logger"
@@ -118,6 +120,8 @@ func beIncubator(args []string) error {
 	euid := uint64(os.Geteuid())
 	// Inform the system that we are about to log someone in.
 	// We can only do this if we are running as root.
+	// This is best effort to still allow running on machines where
+	// we don't support starting session, e.g. darwin.
 	sessionCloser, err := maybeStartLoginSession(logf, uint32(*uid), *localUser, *remoteUser, *remoteIP, *ttyName)
 	if err == nil && sessionCloser != nil {
 		defer sessionCloser()
@@ -178,7 +182,7 @@ func (srv *server) launchProcess(ctx context.Context, s ssh.Session, ci *sshConn
 		stdin, stdout, stderr, err = startWithStdPipes(cmd)
 		return
 	}
-	pty, err := startWithPTY(cmd, ptyReq)
+	pty, err := srv.startWithPTY(cmd, ptyReq)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -196,8 +200,70 @@ func resizeWindow(f *os.File, winCh <-chan ssh.Window) {
 	}
 }
 
+// opcodeShortName is a mapping of SSH opcode
+// to mnemonic names expected by the termios packaage.
+// These are meant to be platform independent.
+var opcodeShortName = map[uint8]string{
+	gossh.VINTR:         "intr",
+	gossh.VQUIT:         "quit",
+	gossh.VERASE:        "erase",
+	gossh.VKILL:         "kill",
+	gossh.VEOF:          "eof",
+	gossh.VEOL:          "eol",
+	gossh.VEOL2:         "eol2",
+	gossh.VSTART:        "start",
+	gossh.VSTOP:         "stop",
+	gossh.VSUSP:         "susp",
+	gossh.VDSUSP:        "dsusp",
+	gossh.VREPRINT:      "rprnt",
+	gossh.VWERASE:       "werase",
+	gossh.VLNEXT:        "lnext",
+	gossh.VFLUSH:        "flush",
+	gossh.VSWTCH:        "swtch",
+	gossh.VSTATUS:       "status",
+	gossh.VDISCARD:      "discard",
+	gossh.IGNPAR:        "ignpar",
+	gossh.PARMRK:        "parmrk",
+	gossh.INPCK:         "inpck",
+	gossh.ISTRIP:        "istrip",
+	gossh.INLCR:         "inlcr",
+	gossh.IGNCR:         "igncr",
+	gossh.ICRNL:         "icrnl",
+	gossh.IUCLC:         "iuclc",
+	gossh.IXON:          "ixon",
+	gossh.IXANY:         "ixany",
+	gossh.IXOFF:         "ixoff",
+	gossh.IMAXBEL:       "imaxbel",
+	gossh.IUTF8:         "iutf8",
+	gossh.ISIG:          "isig",
+	gossh.ICANON:        "icanon",
+	gossh.XCASE:         "xcase",
+	gossh.ECHO:          "echo",
+	gossh.ECHOE:         "echoe",
+	gossh.ECHOK:         "echok",
+	gossh.ECHONL:        "echonl",
+	gossh.NOFLSH:        "noflsh",
+	gossh.TOSTOP:        "tostop",
+	gossh.IEXTEN:        "iexten",
+	gossh.ECHOCTL:       "echoctl",
+	gossh.ECHOKE:        "echoke",
+	gossh.PENDIN:        "pendin",
+	gossh.OPOST:         "opost",
+	gossh.OLCUC:         "olcuc",
+	gossh.ONLCR:         "onlcr",
+	gossh.OCRNL:         "ocrnl",
+	gossh.ONOCR:         "onocr",
+	gossh.ONLRET:        "onlret",
+	gossh.CS7:           "cs7",
+	gossh.CS8:           "cs8",
+	gossh.PARENB:        "parenb",
+	gossh.PARODD:        "parodd",
+	gossh.TTY_OP_ISPEED: "tty_op_ispeed",
+	gossh.TTY_OP_OSPEED: "tty_op_ospeed",
+}
+
 // startWithPTY starts cmd with a psuedo-terminal attached to Stdin, Stdout and Stderr.
-func startWithPTY(cmd *exec.Cmd, ptyReq ssh.Pty) (ptyFile *os.File, err error) {
+func (srv *server) startWithPTY(cmd *exec.Cmd, ptyReq ssh.Pty) (ptyFile *os.File, err error) {
 	var tty *os.File
 	ptyFile, tty, err = pty.Open()
 	if err != nil {
@@ -210,7 +276,7 @@ func startWithPTY(cmd *exec.Cmd, ptyReq ssh.Pty) (ptyFile *os.File, err error) {
 			tty.Close()
 		}
 	}()
-	ptyRawConn, err := ptyFile.SyscallConn()
+	ptyRawConn, err := tty.SyscallConn()
 	if err != nil {
 		return nil, fmt.Errorf("SyscallConn: %w", err)
 	}
@@ -228,21 +294,30 @@ func startWithPTY(cmd *exec.Cmd, ptyReq ssh.Pty) (ptyFile *os.File, err error) {
 		tios.Row = int(ptyReq.Window.Height)
 		tios.Col = int(ptyReq.Window.Width)
 
-		// And these are just stumbling around in the dark temporarily
-		// while we try to match OpenSSH settings. Empirically this makes
-		// stty -a output be the same, but we're still having problems:
-		// https://github.com/tailscale/tailscale/issues/4146
-		// TODO(bradfitz): figure all this out and do something more principled
-		// and confident and documented, once we have a clue.
-		tios.Ispeed = 9600
-		tios.Ospeed = 9600
-		tios.CC["eol"] = 255
-		tios.CC["eol2"] = 255
-		tios.Opts["echok"] = false
-		tios.Opts["imaxbel"] = true
-		tios.Opts["iutf8"] = true
-		tios.Opts["ixany"] = true
-		tios.Opts["pendin"] = true
+		for c, v := range ptyReq.Modes {
+			if c == gossh.TTY_OP_ISPEED {
+				tios.Ispeed = int(v)
+				continue
+			}
+			if c == gossh.TTY_OP_OSPEED {
+				tios.Ospeed = int(v)
+				continue
+			}
+			k, ok := opcodeShortName[c]
+			if !ok {
+				srv.logf("unknown opcode: %d", c)
+				continue
+			}
+			if _, ok := tios.CC[k]; ok {
+				tios.CC[k] = uint8(v)
+				continue
+			}
+			if _, ok := tios.Opts[k]; ok {
+				tios.Opts[k] = v > 0
+				continue
+			}
+			srv.logf("unsupported opcode: %v(%d)=%v", k, c, v)
+		}
 
 		// Save PTY settings.
 		if _, err := tios.STTY(int(fd)); err != nil {
@@ -262,6 +337,8 @@ func startWithPTY(cmd *exec.Cmd, ptyReq ssh.Pty) (ptyFile *os.File, err error) {
 	updateStringInSlice(cmd.Args, "--has-tty=false", "--has-tty=true")
 	if ptyName, err := ptyName(ptyFile); err == nil {
 		updateStringInSlice(cmd.Args, "--tty-name=", "--tty-name="+ptyName)
+		fullPath := filepath.Join("/dev", ptyName)
+		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_TTY=%s", fullPath))
 	}
 
 	if ptyReq.Term != "" {

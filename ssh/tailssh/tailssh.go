@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gliderlabs/ssh"
+	"github.com/tailscale/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
@@ -67,6 +67,7 @@ func (srv *server) newSSHServer() (*ssh.Server, error) {
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
+		Version:                     "SSH-2.0-Tailscale",
 		LocalPortForwardingCallback: srv.portForward,
 	}
 	for k, v := range ssh.DefaultRequestHandlers {
@@ -351,6 +352,10 @@ func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *ssh
 			return
 		}
 	}
+
+	// Take control of the PTY so that we can configure it below.
+	// See https://github.com/tailscale/tailscale/issues/4146
+	s.DisablePTYEmulation()
 
 	cmd, stdin, stdout, stderr, err := srv.launchProcess(ctx, s, ci, lu)
 	if err != nil {
