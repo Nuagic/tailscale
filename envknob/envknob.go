@@ -37,7 +37,7 @@ func noteEnv(k, v string) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if _, ok := set[v]; !ok {
+	if _, ok := set[k]; !ok {
 		list = append(list, k)
 	}
 	set[k] = v
@@ -46,7 +46,7 @@ func noteEnv(k, v string) {
 // logf is logger.Logf, but logger depends on envknob, so for circular
 // dependency reasons, make a type alias (so it's still assignable,
 // but has nice docs here).
-type logf = func(format string, args ...interface{})
+type logf = func(format string, args ...any)
 
 // LogCurrent logs the currently set environment knobs.
 func LogCurrent(logf logf) {
@@ -142,3 +142,10 @@ func LookupInt(envVar string) (v int, ok bool) {
 // UseWIPCode is whether TAILSCALE_USE_WIP_CODE is set to permit use
 // of Work-In-Progress code.
 func UseWIPCode() bool { return Bool("TAILSCALE_USE_WIP_CODE") }
+
+// CanSSHD is whether the Tailscale SSH server is allowed to run.
+//
+// If disabled, the SSH server won't start (won't intercept port 22)
+// if already enabled and any attempt to re-enable it will result in
+// an error.
+func CanSSHD() bool { return !Bool("TS_DISABLE_SSH_SERVER") }

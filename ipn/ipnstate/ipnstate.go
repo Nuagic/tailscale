@@ -112,7 +112,7 @@ type PeerStatus struct {
 
 	// Tags are the list of ACL tags applied to this node.
 	// See tailscale.com/tailcfg#Node.Tags for more information.
-	Tags *views.StringSlice `json:",omitempty"`
+	Tags *views.Slice[string] `json:",omitempty"`
 
 	// PrimaryRoutes are the routes this node is currently the primary
 	// subnet router for, as determined by the control plane. It does
@@ -144,6 +144,9 @@ type PeerStatus struct {
 
 	PeerAPIURL   []string
 	Capabilities []string `json:",omitempty"`
+
+	// SSH_HostKeys are the node's SSH host keys, if known.
+	SSH_HostKeys []string `json:"sshHostKeys,omitempty"`
 
 	// ShareeNode indicates this node exists in the netmap because
 	// it's owned by a shared-to user and that node might connect
@@ -284,6 +287,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if v := st.OS; v != "" {
 		e.OS = st.OS
 	}
+	if v := st.SSH_HostKeys; v != nil {
+		e.SSH_HostKeys = v
+	}
 	if v := st.Addrs; v != nil {
 		e.Addrs = v
 	}
@@ -342,7 +348,7 @@ type StatusUpdater interface {
 }
 
 func (st *Status) WriteHTML(w io.Writer) {
-	f := func(format string, args ...interface{}) { fmt.Fprintf(w, format, args...) }
+	f := func(format string, args ...any) { fmt.Fprintf(w, format, args...) }
 
 	f(`<!DOCTYPE html>
 <html lang="en">

@@ -19,16 +19,16 @@ import (
 )
 
 type response struct {
-	Status string      `json:"status"`
-	Error  string      `json:"error,omitempty"`
-	Data   interface{} `json:"data,omitempty"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+	Data   any    `json:"data,omitempty"`
 }
 
 // JSONHandlerFunc is an HTTP ReturnHandler that writes JSON responses to the client.
 //
 // Return a HTTPError to show an error message, otherwise JSONHandlerFunc will
 // only report "internal server error" to the user with status code 500.
-type JSONHandlerFunc func(r *http.Request) (status int, data interface{}, err error)
+type JSONHandlerFunc func(r *http.Request) (status int, data any, err error)
 
 // ServeHTTPReturn implements the ReturnHandler interface.
 //
@@ -145,19 +145,10 @@ func AcceptsEncoding(r *http.Request, enc string) bool {
 	}
 	remain := h
 	for len(remain) > 0 {
-		comma := strings.Index(remain, ",")
 		var part string
-		if comma == -1 {
-			part = remain
-			remain = ""
-		} else {
-			part = remain[:comma]
-			remain = remain[comma+1:]
-		}
+		part, remain, _ = strings.Cut(remain, ",")
 		part = strings.TrimSpace(part)
-		if i := strings.Index(part, ";"); i != -1 {
-			part = part[:i]
-		}
+		part, _, _ = strings.Cut(part, ";")
 		if part == enc {
 			return true
 		}

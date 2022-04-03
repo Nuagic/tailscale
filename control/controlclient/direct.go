@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"reflect"
 	"runtime"
 	"strings"
@@ -39,6 +38,7 @@ import (
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
@@ -69,6 +69,7 @@ type Direct struct {
 	keepSharerAndUserSplit bool
 	skipIPForwardingCheck  bool
 	pinger                 Pinger
+	popBrowser             func(url string) // or nil
 
 	mu             sync.Mutex        // mutex guards the following fields
 	serverKey      key.MachinePublic // original ("legacy") nacl crypto_box-based public key
@@ -100,9 +101,10 @@ type Options struct {
 	NewDecompressor      func() (Decompressor, error)
 	KeepAlive            bool
 	Logf                 logger.Logf
-	HTTPTestClient       *http.Client // optional HTTP client to use (for tests only)
-	DebugFlags           []string     // debug settings to send to control
-	LinkMonitor          *monitor.Mon // optional link monitor
+	HTTPTestClient       *http.Client     // optional HTTP client to use (for tests only)
+	DebugFlags           []string         // debug settings to send to control
+	LinkMonitor          *monitor.Mon     // optional link monitor
+	PopBrowserURL        func(url string) // optional func to open browser
 
 	// KeepSharerAndUserSplit controls whether the client
 	// understands Node.Sharer. If false, the Sharer is mapped to the User.
@@ -198,6 +200,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		linkMon:                opts.LinkMonitor,
 		skipIPForwardingCheck:  opts.SkipIPForwardingCheck,
 		pinger:                 opts.Pinger,
+		popBrowser:             opts.PopBrowserURL,
 	}
 	if opts.Hostinfo == nil {
 		c.SetHostinfo(hostinfo.New())
@@ -849,7 +852,15 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 			metricMapResponsePings.Add(1)
 			go answerPing(c.logf, c.httpc, pr)
 		}
-
+		if u := resp.PopBrowserURL; u != "" && u != sess.lastPopBrowserURL {
+			sess.lastPopBrowserURL = u
+			if c.popBrowser != nil {
+				c.logf("netmap: control says to open URL %v; opening...", u)
+				c.popBrowser(u)
+			} else {
+				c.logf("netmap: control says to open URL %v; no popBrowser func", u)
+			}
+		}
 		if resp.ControlTime != nil && !resp.ControlTime.IsZero() {
 			c.logf.JSON(1, "controltime", resp.ControlTime.UTC())
 		}
@@ -858,6 +869,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		} else {
 			vlogf("netmap: got new map")
 		}
+
 		select {
 		case timeoutReset <- struct{}{}:
 			vlogf("netmap: sent timer reset")
@@ -945,7 +957,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 
 // decode JSON decodes the res.Body into v. If serverNoiseKey is not specified,
 // it uses the serverKey and mkey to decode the message from the NaCl-crypto-box.
-func decode(res *http.Response, v interface{}, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) error {
+func decode(res *http.Response, v any, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) error {
 	defer res.Body.Close()
 	msg, err := ioutil.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
@@ -970,7 +982,7 @@ var jsonEscapedZero = []byte(`\u0000`)
 // decodeMsg is responsible for uncompressing msg and unmarshaling into v.
 // If c.serverNoiseKey is not specified, it uses the c.serverKey and mkey
 // to first the decrypt msg from the NaCl-crypto-box.
-func (c *Direct) decodeMsg(msg []byte, v interface{}, mkey key.MachinePrivate) error {
+func (c *Direct) decodeMsg(msg []byte, v any, mkey key.MachinePrivate) error {
 	c.mu.Lock()
 	serverKey := c.serverKey
 	serverNoiseKey := c.serverNoiseKey
@@ -1016,7 +1028,7 @@ func (c *Direct) decodeMsg(msg []byte, v interface{}, mkey key.MachinePrivate) e
 
 }
 
-func decodeMsg(msg []byte, v interface{}, serverKey key.MachinePublic, machinePrivKey key.MachinePrivate) error {
+func decodeMsg(msg []byte, v any, serverKey key.MachinePublic, machinePrivKey key.MachinePrivate) error {
 	decrypted, ok := machinePrivKey.OpenFrom(serverKey, msg)
 	if !ok {
 		return errors.New("cannot decrypt response")
@@ -1032,7 +1044,7 @@ func decodeMsg(msg []byte, v interface{}, serverKey key.MachinePublic, machinePr
 
 // encode JSON encodes v. If serverNoiseKey is not specified, it uses the serverKey and mkey to
 // seal the message into a NaCl-crypto-box.
-func encode(v interface{}, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) ([]byte, error) {
+func encode(v any, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) ([]byte, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -1139,89 +1151,17 @@ func TrimWGConfig() opt.Bool {
 //
 // It should not return false positives.
 //
-// TODO(bradfitz): merge this code into LocalBackend.CheckIPForwarding
-// and change controlclient.Options.SkipIPForwardingCheck into a
-// func([]netaddr.IPPrefix) error signature instead. Then we only have
-// one copy of this code.
+// TODO(bradfitz): Change controlclient.Options.SkipIPForwardingCheck into a
+// func([]netaddr.IPPrefix) error signature instead.
 func ipForwardingBroken(routes []netaddr.IPPrefix, state *interfaces.State) bool {
-	if len(routes) == 0 {
-		// Nothing to route, so no need to warn.
+	warn, err := netutil.CheckIPForwarding(routes, state)
+	if err != nil {
+		// Oh well, we tried. This is just for debugging.
+		// We don't want false positives.
+		// TODO: maybe we want a different warning for inability to check?
 		return false
 	}
-
-	if runtime.GOOS != "linux" {
-		// We only do subnet routing on Linux for now.
-		// It might work on darwin/macOS when building from source, so
-		// don't return true for other OSes. We can OS-based warnings
-		// already in the admin panel.
-		return false
-	}
-
-	localIPs := map[netaddr.IP]bool{}
-	for _, addrs := range state.InterfaceIPs {
-		for _, pfx := range addrs {
-			localIPs[pfx.IP()] = true
-		}
-	}
-
-	v4Routes, v6Routes := false, false
-	for _, r := range routes {
-		// It's possible to advertise a route to one of the local
-		// machine's local IPs. IP forwarding isn't required for this
-		// to work, so we shouldn't warn for such exports.
-		if r.IsSingleIP() && localIPs[r.IP()] {
-			continue
-		}
-		if r.IP().Is4() {
-			v4Routes = true
-		} else {
-			v6Routes = true
-		}
-	}
-
-	if v4Routes {
-		out, err := ioutil.ReadFile("/proc/sys/net/ipv4/ip_forward")
-		if err != nil {
-			// Try another way.
-			out, err = exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
-		}
-		if err != nil {
-			// Oh well, we tried. This is just for debugging.
-			// We don't want false positives.
-			// TODO: maybe we want a different warning for inability to check?
-			return false
-		}
-		if strings.TrimSpace(string(out)) == "0" {
-			return true
-		}
-	}
-	if v6Routes {
-		// Note: you might be wondering why we check only the state of
-		// conf.all.forwarding, rather than per-interface forwarding
-		// configuration. According to kernel documentation, it seems
-		// that to actually forward packets, you need to enable
-		// forwarding globally, and the per-interface forwarding
-		// setting only alters other things such as how router
-		// advertisements are handled. The kernel itself warns that
-		// enabling forwarding per-interface and not globally will
-		// probably not work, so I feel okay calling those configs
-		// broken until we have proof otherwise.
-		out, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/forwarding")
-		if err != nil {
-			out, err = exec.Command("sysctl", "-n", "net.ipv6.conf.all.forwarding").Output()
-		}
-		if err != nil {
-			// Oh well, we tried. This is just for debugging.
-			// We don't want false positives.
-			// TODO: maybe we want a different warning for inability to check?
-			return false
-		}
-		if strings.TrimSpace(string(out)) == "0" {
-			return true
-		}
-	}
-
-	return false
+	return warn != nil
 }
 
 // isUniquePingRequest reports whether pr contains a new PingRequest.URL
@@ -1310,7 +1250,7 @@ func (c *Direct) getNoiseClient() (*noiseClient, error) {
 	if nc != nil {
 		return nc, nil
 	}
-	np, err, _ := c.sfGroup.Do("noise", func() (interface{}, error) {
+	np, err, _ := c.sfGroup.Do("noise", func() (any, error) {
 		k, err := c.getMachinePrivKey()
 		if err != nil {
 			return nil, err

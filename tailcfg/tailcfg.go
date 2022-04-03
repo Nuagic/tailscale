@@ -65,7 +65,8 @@ type CapabilityVersion int
 //    26: 2022-01-12: (nothing, just bumping for 1.20.0)
 //    27: 2022-02-18: start of SSHPolicy being respected
 //    28: 2022-03-09: client can communicate over Noise.
-const CurrentCapabilityVersion CapabilityVersion = 28
+//    29: 2022-03-09: MapResponse.PopBrowserURL
+const CurrentCapabilityVersion CapabilityVersion = 29
 
 type StableID string
 
@@ -527,12 +528,12 @@ func (v HostinfoView) RoutableIPs() views.IPPrefixSlice {
 	return views.IPPrefixSliceOf(v.ж.RoutableIPs)
 }
 
-func (v HostinfoView) RequestTags() views.StringSlice {
-	return views.StringSliceOf(v.ж.RequestTags)
+func (v HostinfoView) RequestTags() views.Slice[string] {
+	return views.SliceOf(v.ж.RequestTags)
 }
 
-func (v HostinfoView) SSH_HostKeys() views.StringSlice {
-	return views.StringSliceOf(v.ж.SSH_HostKeys)
+func (v HostinfoView) SSH_HostKeys() views.Slice[string] {
+	return views.SliceOf(v.ж.SSH_HostKeys)
 }
 
 func (v HostinfoView) Services() ServiceSlice {
@@ -1221,7 +1222,7 @@ type PingRequest struct {
 type MapResponse struct {
 	// KeepAlive, if set, represents an empty message just to keep
 	// the connection alive. When true, all other fields except
-	// PingRequest are ignored.
+	// PingRequest, ControlTime, and PopBrowserURL are ignored.
 	KeepAlive bool `json:",omitempty"`
 
 	// PingRequest, if non-empty, is a request to the client to
@@ -1230,6 +1231,11 @@ type MapResponse struct {
 	// PingRequest may be sent on any MapResponse (ones with
 	// KeepAlive true or false).
 	PingRequest *PingRequest `json:",omitempty"`
+
+	// PopBrowserURL, if non-empty, is a URL for the client to
+	// open to complete an action. The client should dup suppress
+	// identical URLs and only open it once for the same URL.
+	PopBrowserURL string
 
 	// Networking
 
@@ -1573,6 +1579,8 @@ type SSHRule struct {
 	// actual user that's logged in.
 	// If the map value is the empty string (for either the
 	// requested SSH user or "*"), the rule doesn't match.
+	// If the map value is "=", it means the ssh-user should map
+	// directly to the local-user.
 	// It may be nil if the Action is reject.
 	SSHUsers map[string]string `json:"sshUsers"`
 
@@ -1615,6 +1623,10 @@ type SSHAction struct {
 	// before being forcefully terminated.
 	SesssionDuration time.Duration `json:"sessionDuration,omitempty"`
 
+	// AllowAgentForwarding, if true, allows accepted connections to forward
+	// the ssh agent if requested.
+	AllowAgentForwarding bool `json:"allowAgentForwarding,omitempty"`
+
 	// HoldAndDelegate, if non-empty, is a URL that serves an
 	// outcome verdict.  The connection will be accepted and will
 	// block until the provided long-polling URL serves a new
@@ -1623,7 +1635,20 @@ type SSHAction struct {
 	// If the long poll breaks before returning a complete HTTP
 	// response, it should be re-fetched as long as the SSH
 	// session is open.
+	//
+	// The following variables in the URL are expanded by tailscaled:
+	//
+	//   * $SRC_NODE_IP (URL escaped)
+	//   * $SRC_NODE_ID (Node.ID as int64 string)
+	//   * $DST_NODE_IP (URL escaped)
+	//   * $DST_NODE_ID (Node.ID as int64 string)
+	//   * $SSH_USER (URL escaped, ssh user requested)
+	//   * $LOCAL_USER (URL escaped, local user mapped)
 	HoldAndDelegate string `json:"holdAndDelegate,omitempty"`
+
+	// AllowLocalPortForwarding, if true, allows accepted connections
+	// to use local port forwarding if requested.
+	AllowLocalPortForwarding bool `json:"allowLocalPortForwarding,omitempty"`
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>

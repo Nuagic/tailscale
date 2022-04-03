@@ -5,7 +5,6 @@
 package ipnlocal
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -35,6 +33,7 @@ import (
 	"tailscale.com/ipn/policy"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
@@ -65,6 +64,7 @@ import (
 )
 
 var controlDebugFlags = getControlDebugFlags()
+var canSSH = envknob.CanSSHD()
 
 func getControlDebugFlags() []string {
 	if e := envknob.String("TS_DEBUG_CONTROL_FLAGS"); e != "" {
@@ -139,6 +139,7 @@ type LocalBackend struct {
 	peerAPIListeners []*peerAPIListener
 	loginFlags       controlclient.LoginFlags
 	incomingFiles    map[*incomingFile]bool
+	lastStatusTime   time.Time // status.AsOf value of the last processed status update
 	// directFileRoot, if non-empty, means to write received files
 	// directly to this directory, without staging them in an
 	// intermediate buffered directory for "pick-up" later. If
@@ -444,10 +445,10 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 		exitNodeOption := tsaddr.PrefixesContainsFunc(p.AllowedIPs, func(r netaddr.IPPrefix) bool {
 			return r.Bits() == 0
 		})
-		var tags *views.StringSlice
+		var tags *views.Slice[string]
 		var primaryRoutes *views.IPPrefixSlice
 		if p.Tags != nil {
-			v := views.StringSliceOf(p.Tags)
+			v := views.SliceOf(p.Tags)
 			tags = &v
 		}
 		if p.PrimaryRoutes != nil {
@@ -471,6 +472,7 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			ShareeNode:     p.Hostinfo.ShareeNode(),
 			ExitNode:       p.StableID != "" && p.StableID == b.prefs.ExitNodeID,
 			ExitNodeOption: exitNodeOption,
+			SSH_HostKeys:   p.Hostinfo.SSH_HostKeys().AsSlice(),
 		})
 	}
 }
@@ -704,6 +706,13 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	}
 
 	b.mu.Lock()
+	if s.AsOf.Before(b.lastStatusTime) {
+		// Don't process a status update that is older than the one we have
+		// already processed. (corp#2579)
+		b.mu.Unlock()
+		return
+	}
+	b.lastStatusTime = s.AsOf
 	es := b.parseWgStatusLocked(s)
 	cc := b.cc
 	b.engineStatus = es
@@ -973,6 +982,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		DebugFlags:           debugFlags,
 		LinkMonitor:          b.e.GetLinkMonitor(),
 		Pinger:               b.e,
+		PopBrowserURL:        b.tellClientToBrowseToURL,
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
@@ -1370,9 +1380,15 @@ func (b *LocalBackend) popBrowserAuthNow() {
 
 	b.blockEngineUpdates(true)
 	b.stopEngineAndWait()
-	b.send(ipn.Notify{BrowseToURL: &url})
+	b.tellClientToBrowseToURL(url)
 	if b.State() == ipn.Running {
 		b.enterState(ipn.Starting)
+	}
+}
+
+func (b *LocalBackend) tellClientToBrowseToURL(url string) {
+	if url != "" {
+		b.send(ipn.Notify{BrowseToURL: &url})
 	}
 }
 
@@ -1557,7 +1573,7 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 
 	b.logf("using backend prefs for %q: %s", key, b.prefs.Pretty())
 
-	b.sshAtomicBool.Set(b.prefs != nil && b.prefs.RunSSH)
+	b.sshAtomicBool.Set(b.prefs != nil && b.prefs.RunSSH && canSSH)
 
 	return nil
 }
@@ -1696,6 +1712,11 @@ func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
 	p0 := b.prefs.Clone()
 	p1 := b.prefs.Clone()
 	p1.ApplyEdits(mp)
+	if p1.RunSSH && !canSSH {
+		b.mu.Unlock()
+		b.logf("EditPrefs requests SSH, but disabled by envknob; returning error")
+		return nil, errors.New("Tailscale SSH server administratively disabled.")
+	}
 	if p1.Equals(p0) {
 		b.mu.Unlock()
 		return p1, nil
@@ -1725,7 +1746,7 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 	netMap := b.netMap
 	stateKey := b.stateKey
 
-	b.sshAtomicBool.Set(newp.RunSSH)
+	b.sshAtomicBool.Set(newp.RunSSH && canSSH)
 
 	oldp := b.prefs
 	newp.Persist = oldp.Persist // caller isn't allowed to override this
@@ -2455,7 +2476,7 @@ func (b *LocalBackend) applyPrefsToHostinfo(hi *tailcfg.Hostinfo, prefs *ipn.Pre
 	hi.ShieldsUp = prefs.ShieldsUp
 
 	var sshHostKeys []string
-	if prefs.RunSSH {
+	if prefs.RunSSH && canSSH {
 		// TODO(bradfitz): this is called with b.mu held. Not ideal.
 		// If the filesystem gets wedged or something we could block for
 		// a long time. But probably fine.
@@ -2672,7 +2693,7 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	b.sshAtomicBool.Set(false)
 }
 
-func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Get() }
+func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Get() && canSSH }
 
 // Logout tells the controlclient that we want to log out, and
 // transitions the local engine to the logged-out state without
@@ -3016,105 +3037,17 @@ func nodeIP(n *tailcfg.Node, pred func(netaddr.IP) bool) netaddr.IP {
 	return netaddr.IP{}
 }
 
-func isBSD(s string) bool {
-	return s == "dragonfly" || s == "freebsd" || s == "netbsd" || s == "openbsd"
-}
-
 func (b *LocalBackend) CheckIPForwarding() error {
 	if wgengine.IsNetstackRouter(b.e) {
 		return nil
 	}
 
-	switch {
-	case isBSD(runtime.GOOS):
-		return fmt.Errorf("Subnet routing and exit nodes only work with additional manual configuration on %v, and is not currently officially supported.", runtime.GOOS)
-	case runtime.GOOS == "linux":
-		return checkIPForwardingLinux()
-	default:
-		// TODO: subnet routing and exit nodes probably don't work
-		// correctly on non-linux, non-netstack OSes either. Warn
-		// instead of being silent?
-		return nil
-	}
-}
-
-// checkIPForwardingLinux checks if IP forwarding is enabled correctly
-// for subnet routing and exit node functionality. Returns an error
-// describing configuration issues if the configuration is not
-// definitely good.
-func checkIPForwardingLinux() error {
-	const kbLink = "\nSee https://tailscale.com/kb/1104/enable-ip-forwarding/"
-
-	disabled, err := disabledSysctls("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding")
+	// TODO: let the caller pass in the ranges.
+	warn, err := netutil.CheckIPForwarding(tsaddr.ExitRoutes(), nil)
 	if err != nil {
-		return fmt.Errorf("Couldn't check system's IP forwarding configuration, subnet routing/exit nodes may not work: %w%s", err, kbLink)
+		return err
 	}
-
-	if len(disabled) == 0 {
-		// IP forwarding is enabled systemwide, all is well.
-		return nil
-	}
-
-	// IP forwarding isn't enabled globally, but it might be enabled
-	// on a per-interface basis. Check if it's on for all interfaces,
-	// and warn appropriately if it's not.
-	ifaces, err := interfaces.GetList()
-	if err != nil {
-		return fmt.Errorf("Couldn't enumerate network interfaces, subnet routing/exit nodes may not work: %w%s", err, kbLink)
-	}
-
-	var (
-		warnings   []string
-		anyEnabled bool
-	)
-	for _, iface := range ifaces {
-		if iface.Name == "lo" {
-			continue
-		}
-		disabled, err = disabledSysctls(fmt.Sprintf("net.ipv4.conf.%s.forwarding", iface.Name), fmt.Sprintf("net.ipv6.conf.%s.forwarding", iface.Name))
-		if err != nil {
-			return fmt.Errorf("Couldn't check system's IP forwarding configuration, subnet routing/exit nodes may not work: %w%s", err, kbLink)
-		}
-		if len(disabled) > 0 {
-			warnings = append(warnings, fmt.Sprintf("Traffic received on %s won't be forwarded (%s disabled)", iface.Name, strings.Join(disabled, ", ")))
-		} else {
-			anyEnabled = true
-		}
-	}
-	if !anyEnabled {
-		// IP forwarding is compeltely disabled, just say that rather
-		// than enumerate all the interfaces on the system.
-		return fmt.Errorf("IP forwarding is disabled, subnet routing/exit nodes will not work.%s", kbLink)
-	}
-	if len(warnings) > 0 {
-		// If partially enabled, enumerate the bits that won't work.
-		return fmt.Errorf("%s\nSubnet routes and exit nodes may not work correctly.%s", strings.Join(warnings, "\n"), kbLink)
-	}
-
-	return nil
-}
-
-// disabledSysctls checks if the given sysctl keys are off, according
-// to strconv.ParseBool. Returns a list of keys that are disabled, or
-// err if something went wrong which prevented the lookups from
-// completing.
-func disabledSysctls(sysctls ...string) (disabled []string, err error) {
-	for _, k := range sysctls {
-		// TODO: on linux, we can get at these values via /proc/sys,
-		// rather than fork subcommands that may not be installed.
-		bs, err := exec.Command("sysctl", "-n", k).Output()
-		if err != nil {
-			return nil, fmt.Errorf("couldn't check %s (%v)", k, err)
-		}
-		on, err := strconv.ParseBool(string(bytes.TrimSpace(bs)))
-		if err != nil {
-			return nil, fmt.Errorf("couldn't parse %s (%v)", k, err)
-		}
-		if !on {
-			disabled = append(disabled, k)
-		}
-	}
-	return disabled, nil
+	return warn
 }
 
 // DERPMap returns the current DERPMap in use, or nil if not connected.

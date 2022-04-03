@@ -10,26 +10,33 @@ package tailssh
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/tailscale/ssh"
+	gossh "github.com/tailscale/golang-x-crypto/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
 )
 
@@ -68,7 +75,11 @@ func (srv *server) newSSHServer() (*ssh.Server, error) {
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
 		Version:                     "SSH-2.0-Tailscale",
-		LocalPortForwardingCallback: srv.portForward,
+		LocalPortForwardingCallback: srv.mayForwardLocalPortTo,
+		NoClientAuthCallback: func(m gossh.ConnMetadata) (*gossh.Permissions, error) {
+			srv.logf("SSH connection from %v for %q; client ver %q", m.RemoteAddr(), m.User(), m.ClientVersion())
+			return nil, nil
+		},
 	}
 	for k, v := range ssh.DefaultRequestHandlers {
 		ss.RequestHandlers[k] = v
@@ -95,17 +106,22 @@ type server struct {
 	tailscaledPath string
 
 	// mu protects activeSessions.
-	mu             sync.Mutex
-	activeSessions map[string]bool
+	mu                      sync.Mutex
+	activeSessionByH        map[string]*sshSession // ssh.SessionID (DH H) => that session
+	activeSessionBySharedID map[string]*sshSession // yyymmddThhmmss-XXXXX => session
 }
 
 var debugPolicyFile = envknob.String("TS_DEBUG_SSH_POLICY_FILE")
 
-// portForward reports whether the ctx should be allowed to port forward
+// mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (srv *server) portForward(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
-	return srv.isActiveSession(ctx)
+func (srv *server) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+	ss, ok := srv.getSessionForContext(ctx)
+	if !ok {
+		return false
+	}
+	return ss.action.AllowLocalPortForwarding
 }
 
 // sshPolicy returns the SSHPolicy for current node.
@@ -204,39 +220,6 @@ func (srv *server) handleSSH(s ssh.Session) {
 		return
 	}
 
-	// Loop processing/fetching Actions until one reaches a
-	// terminal state (Accept, Reject, or invalid Action), or
-	// until fetchSSHAction times out due to the context being
-	// done (client disconnect) or its 30 minute timeout passes.
-	// (Which is a long time for somebody to see login
-	// instructions and go to a URL to do something.)
-ProcessAction:
-	for {
-		if action.Message != "" {
-			io.WriteString(s.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
-		}
-		if action.Reject {
-			logf("ssh: access denied for %q from %v", ci.uprof.LoginName, ci.src.IP())
-			s.Exit(1)
-			return
-		}
-		if action.Accept {
-			break ProcessAction
-		}
-		url := action.HoldAndDelegate
-		if url == "" {
-			logf("ssh: access denied; SSHAction has neither Reject, Accept, or next step URL")
-			s.Exit(1)
-			return
-		}
-		action, err = srv.fetchSSHAction(s.Context(), url)
-		if err != nil {
-			logf("ssh: fetching SSAction from %s: %v", url, err)
-			s.Exit(1)
-			return
-		}
-	}
-
 	lu, err := user.Lookup(localUser)
 	if err != nil {
 		logf("ssh: user Lookup %q: %v", localUser, err)
@@ -244,19 +227,111 @@ ProcessAction:
 		return
 	}
 
-	var ctx context.Context = context.Background()
-	if action.SesssionDuration != 0 {
-		sctx := newSSHContext()
-		ctx = sctx
-		t := time.AfterFunc(action.SesssionDuration, func() {
-			sctx.CloseWithError(userVisibleError{
-				fmt.Sprintf("Session timeout of %v elapsed.", action.SesssionDuration),
-				context.DeadlineExceeded,
-			})
-		})
-		defer t.Stop()
+	ss := srv.newSSHSession(s, ci, lu)
+	action, err = ss.resolveTerminalAction(action)
+	if err != nil {
+		logf("ssh: resolveTerminalAction: %v", err)
+		io.WriteString(s.Stderr(), "Access denied: failed to resolve SSHAction.\n")
+		s.Exit(1)
+		return
 	}
-	srv.handleAcceptedSSH(ctx, s, ci, lu)
+	if action.Reject || !action.Accept {
+		logf("ssh: access denied for %q from %v", ci.uprof.LoginName, ci.src.IP())
+		s.Exit(1)
+		return
+	}
+
+	ss.action = action
+	ss.run()
+}
+
+// resolveTerminalAction either returns action (if it's Accept or Reject) or else
+// loops, fetching new SSHActions from the control plane.
+//
+// Any action with a Message in the chain will be printed to ss.
+//
+// The returned SSHAction will be either Reject or Accept.
+func (ss *sshSession) resolveTerminalAction(action *tailcfg.SSHAction) (*tailcfg.SSHAction, error) {
+	// Loop processing/fetching Actions until one reaches a
+	// terminal state (Accept, Reject, or invalid Action), or
+	// until fetchSSHAction times out due to the context being
+	// done (client disconnect) or its 30 minute timeout passes.
+	// (Which is a long time for somebody to see login
+	// instructions and go to a URL to do something.)
+	for {
+		if action.Message != "" {
+			io.WriteString(ss.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
+		}
+		if action.Accept || action.Reject {
+			return action, nil
+		}
+		url := action.HoldAndDelegate
+		if url == "" {
+			return nil, errors.New("reached Action that lacked Accept, Reject, and HoldAndDelegate")
+		}
+		url = ss.expandDelegateURL(url)
+		var err error
+		action, err = ss.srv.fetchSSHAction(ss.Context(), url)
+		if err != nil {
+			return nil, fmt.Errorf("fetching SSHAction from %s: %w", url, err)
+		}
+	}
+}
+
+func (ss *sshSession) expandDelegateURL(actionURL string) string {
+	nm := ss.srv.lb.NetMap()
+	var dstNodeID string
+	if nm != nil {
+		dstNodeID = fmt.Sprint(int64(nm.SelfNode.ID))
+	}
+	return strings.NewReplacer(
+		"$SRC_NODE_IP", url.QueryEscape(ss.connInfo.src.IP().String()),
+		"$SRC_NODE_ID", fmt.Sprint(int64(ss.connInfo.node.ID)),
+		"$DST_NODE_IP", url.QueryEscape(ss.connInfo.dst.IP().String()),
+		"$DST_NODE_ID", dstNodeID,
+		"$SSH_USER", url.QueryEscape(ss.connInfo.sshUser),
+		"$LOCAL_USER", url.QueryEscape(ss.localUser.Username),
+	).Replace(actionURL)
+}
+
+// sshSession is an accepted Tailscale SSH session.
+type sshSession struct {
+	ssh.Session
+	idH      string // the RFC4253 sec8 hash H; don't share outside process
+	sharedID string // ID that's shared with control
+	logf     logger.Logf
+
+	ctx           *sshContext // implements context.Context
+	srv           *server
+	connInfo      *sshConnInfo
+	action        *tailcfg.SSHAction
+	localUser     *user.User
+	agentListener net.Listener // non-nil if agent-forwarding requested+allowed
+
+	// initialized by launchProcess:
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout io.Reader
+	stderr io.Reader // nil for pty sessions
+	ptyReq *ssh.Pty  // non-nil for pty sessions
+
+	// We use this sync.Once to ensure that we only terminate the process once,
+	// either it exits itself or is terminated
+	exitOnce sync.Once
+}
+
+func (srv *server) newSSHSession(s ssh.Session, ci *sshConnInfo, lu *user.User) *sshSession {
+	sharedID := fmt.Sprintf("%s-%02x", ci.now.UTC().Format("20060102T150405"), randBytes(5))
+	return &sshSession{
+		Session:   s,
+		idH:       s.Context().(ssh.Context).SessionID(),
+		sharedID:  sharedID,
+		ctx:       newSSHContext(),
+		srv:       srv,
+		localUser: lu,
+		connInfo:  ci,
+		logf:      logger.WithPrefix(srv.logf, "ssh-session("+sharedID+"): "),
+	}
 }
 
 func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHAction, error) {
@@ -277,12 +352,20 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 			continue
 		}
 		if res.StatusCode != 200 {
+			body, _ := io.ReadAll(res.Body)
 			res.Body.Close()
+			if len(body) > 1<<10 {
+				body = body[:1<<10]
+			}
+			srv.logf("fetch of %v: %s, %s", url, res.Status, body)
 			bo.BackOff(ctx, fmt.Errorf("unexpected status: %v", res.Status))
 			continue
 		}
 		a := new(tailcfg.SSHAction)
-		if err := json.NewDecoder(res.Body).Decode(a); err != nil {
+		err = json.NewDecoder(res.Body).Decode(a)
+		res.Body.Close()
+		if err != nil {
+			srv.logf("invalid next SSHAction JSON from %v: %v", url, err)
 			bo.BackOff(ctx, err)
 			continue
 		}
@@ -290,133 +373,236 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 	}
 }
 
-func (srv *server) handleSessionTermination(ctx context.Context, s ssh.Session, ci *sshConnInfo, cmd *exec.Cmd, exitOnce *sync.Once) {
-	<-ctx.Done()
+// killProcessOnContextDone waits for ss.ctx to be done and kills the process,
+// unless the process has already exited.
+func (ss *sshSession) killProcessOnContextDone() {
+	<-ss.ctx.Done()
 	// Either the process has already existed, in which case this does nothing.
 	// Or, the process is still running in which case this will kill it.
-	exitOnce.Do(func() {
-		err := ctx.Err()
+	ss.exitOnce.Do(func() {
+		err := ss.ctx.Err()
 		if serr, ok := err.(SSHTerminationError); ok {
 			msg := serr.SSHTerminationMessage()
 			if msg != "" {
-				io.WriteString(s.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
+				io.WriteString(ss.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
 			}
 		}
-		srv.logf("terminating SSH session from %v: %v", ci.src.IP(), err)
-		cmd.Process.Kill()
+		ss.logf("terminating SSH session from %v: %v", ss.connInfo.src.IP(), err)
+		ss.cmd.Process.Kill()
 	})
 }
 
-// isActiveSession reports whether the ssh.Context corresponds
-// to an active session.
-func (srv *server) isActiveSession(sctx ssh.Context) bool {
+// sessionAction returns the SSHAction associated with the session.
+func (srv *server) getSessionForContext(sctx ssh.Context) (ss *sshSession, ok bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	return srv.activeSessions[sctx.SessionID()]
+	ss, ok = srv.activeSessionByH[sctx.SessionID()]
+	return
 }
 
-// startSession registers s as an active session.
-func (srv *server) startSession(s ssh.Session) {
+// startSession registers ss as an active session.
+func (srv *server) startSession(ss *sshSession) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	if srv.activeSessions == nil {
-		srv.activeSessions = make(map[string]bool)
+	if srv.activeSessionByH == nil {
+		srv.activeSessionByH = make(map[string]*sshSession)
 	}
-	srv.activeSessions[s.Context().(ssh.Context).SessionID()] = true
+	if srv.activeSessionBySharedID == nil {
+		srv.activeSessionBySharedID = make(map[string]*sshSession)
+	}
+	if ss.idH == "" {
+		panic("empty idH")
+	}
+	if _, dup := srv.activeSessionByH[ss.idH]; dup {
+		panic("dup idH")
+	}
+	if ss.sharedID == "" {
+		panic("empty sharedID")
+	}
+	if _, dup := srv.activeSessionBySharedID[ss.sharedID]; dup {
+		panic("dup sharedID")
+	}
+	srv.activeSessionByH[ss.idH] = ss
+	srv.activeSessionBySharedID[ss.sharedID] = ss
 }
 
 // endSession unregisters s from the list of active sessions.
-func (srv *server) endSession(s ssh.Session) {
+func (srv *server) endSession(ss *sshSession) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	delete(srv.activeSessions, s.Context().(ssh.Context).SessionID())
+	delete(srv.activeSessionByH, ss.idH)
+	delete(srv.activeSessionBySharedID, ss.sharedID)
 }
 
-// handleAcceptedSSH handles s once it's been accepted and determined
-// that it should run as local system user lu.
+var errSessionDone = errors.New("session is done")
+
+// handleSSHAgentForwarding starts a Unix socket listener and in the background
+// forwards agent connections between the listenr and the ssh.Session.
+// On success, it assigns ss.agentListener.
+func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) error {
+	if !ssh.AgentRequested(ss) || !ss.action.AllowAgentForwarding {
+		return nil
+	}
+	ss.logf("ssh: agent forwarding requested")
+	ln, err := ssh.NewAgentListener()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil && ln != nil {
+			ln.Close()
+		}
+	}()
+
+	uid, err := strconv.ParseUint(lu.Uid, 10, 32)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.ParseUint(lu.Gid, 10, 32)
+	if err != nil {
+		return err
+	}
+	socket := ln.Addr().String()
+	dir := filepath.Dir(socket)
+	// Make sure the socket is accessible by the user.
+	if err := os.Chown(socket, int(uid), int(gid)); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		return err
+	}
+
+	go ssh.ForwardAgentConnections(ln, s)
+	ss.agentListener = ln
+	return nil
+}
+
+// recordSSH is a temporary dev knob to test the SSH recording
+// functionality and support off-node streaming.
 //
-// When ctx is done, the session is forcefully terminated. If its Err
-// is an SSHTerminationError, its SSHTerminationMessage is sent to the
-// user.
-func (srv *server) handleAcceptedSSH(ctx context.Context, s ssh.Session, ci *sshConnInfo, lu *user.User) {
-	srv.startSession(s)
-	defer srv.endSession(s)
+// TODO(bradfitz,maisem): move this to SSHPolicy.
+var recordSSH = envknob.Bool("TS_DEBUG_LOG_SSH")
+
+// run is the entrypoint for a newly accepted SSH session.
+//
+// It handles ss once it's been accepted and determined
+// that it should run.
+func (ss *sshSession) run() {
+	srv := ss.srv
+	srv.startSession(ss)
+	defer srv.endSession(ss)
+
+	defer ss.ctx.CloseWithError(errSessionDone)
+
+	if ss.action.SesssionDuration != 0 {
+		t := time.AfterFunc(ss.action.SesssionDuration, func() {
+			ss.ctx.CloseWithError(userVisibleError{
+				fmt.Sprintf("Session timeout of %v elapsed.", ss.action.SesssionDuration),
+				context.DeadlineExceeded,
+			})
+		})
+		defer t.Stop()
+	}
+
 	logf := srv.logf
+	lu := ss.localUser
 	localUser := lu.Username
 
 	if euid := os.Geteuid(); euid != 0 {
 		if lu.Uid != fmt.Sprint(euid) {
 			logf("ssh: can't switch to user %q from process euid %v", localUser, euid)
-			fmt.Fprintf(s, "can't switch user\n")
-			s.Exit(1)
+			fmt.Fprintf(ss, "can't switch user\n")
+			ss.Exit(1)
 			return
 		}
 	}
 
 	// Take control of the PTY so that we can configure it below.
 	// See https://github.com/tailscale/tailscale/issues/4146
-	s.DisablePTYEmulation()
+	ss.DisablePTYEmulation()
 
-	cmd, stdin, stdout, stderr, err := srv.launchProcess(ctx, s, ci, lu)
+	if err := ss.handleSSHAgentForwarding(ss, lu); err != nil {
+		logf("ssh: agent forwarding failed: %v", err)
+	} else if ss.agentListener != nil {
+		// TODO(maisem/bradfitz): add a way to close all session resources
+		defer ss.agentListener.Close()
+	}
+
+	var rec *recording // or nil if disabled
+	if ss.shouldRecord() {
+		var err error
+		rec, err = ss.startNewRecording()
+		if err != nil {
+			fmt.Fprintf(ss, "can't start new recording\n")
+			logf("startNewRecording: %v", err)
+			ss.Exit(1)
+			return
+		}
+		defer rec.Close()
+	}
+
+	err := ss.launchProcess(ss.ctx)
 	if err != nil {
 		logf("start failed: %v", err.Error())
-		s.Exit(1)
+		ss.Exit(1)
 		return
 	}
-	// We use this sync.Once to ensure that we only terminate the process once,
-	// either it exits itself or is terminated
-	var exitOnce sync.Once
-	if ctx.Done() != nil {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		go srv.handleSessionTermination(ctx, s, ci, cmd, &exitOnce)
-	}
+	go ss.killProcessOnContextDone()
+
 	go func() {
-		_, err := io.Copy(stdin, s)
+		_, err := io.Copy(rec.writer("i", ss.stdin), ss)
 		if err != nil {
 			// TODO: don't log in the success case.
 			logf("ssh: stdin copy: %v", err)
 		}
-		stdin.Close()
+		ss.stdin.Close()
 	}()
 	go func() {
-		_, err := io.Copy(s, stdout)
+		_, err := io.Copy(rec.writer("o", ss), ss.stdout)
 		if err != nil {
 			// TODO: don't log in the success case.
 			logf("ssh: stdout copy: %v", err)
 		}
 	}()
 	// stderr is nil for ptys.
-	if stderr != nil {
+	if ss.stderr != nil {
 		go func() {
-			_, err := io.Copy(s.Stderr(), stderr)
+			_, err := io.Copy(ss.Stderr(), ss.stderr)
 			if err != nil {
 				// TODO: don't log in the success case.
 				logf("ssh: stderr copy: %v", err)
 			}
 		}()
 	}
-	err = cmd.Wait()
+	err = ss.cmd.Wait()
 	// This will either make the SSH Termination goroutine be a no-op,
 	// or itself will be a no-op because the process was killed by the
 	// aforementioned goroutine.
-	exitOnce.Do(func() {})
+	ss.exitOnce.Do(func() {})
 
 	if err == nil {
 		logf("ssh: Wait: ok")
-		s.Exit(0)
+		ss.Exit(0)
 		return
 	}
 	if ee, ok := err.(*exec.ExitError); ok {
 		code := ee.ProcessState.ExitCode()
 		logf("ssh: Wait: code=%v", code)
-		s.Exit(code)
+		ss.Exit(code)
 		return
 	}
 
 	logf("ssh: Wait: %v", err)
-	s.Exit(1)
+	ss.Exit(1)
 	return
+}
+
+func (ss *sshSession) shouldRecord() bool {
+	// for now only record pty sessions
+	// TODO(bradfitz,maisem): make configurable on SSHPolicy and
+	// support recording non-pty stuff too.
+	_, _, isPtyReq := ss.Pty()
+	return recordSSH && isPtyReq
 }
 
 type sshConnInfo struct {
@@ -481,10 +667,14 @@ func matchRule(r *tailcfg.SSHRule, ci *sshConnInfo) (a *tailcfg.SSHAction, local
 }
 
 func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser string) {
-	if v, ok := ruleSSHUsers[reqSSHUser]; ok {
-		return v
+	v, ok := ruleSSHUsers[reqSSHUser]
+	if !ok {
+		v = ruleSSHUsers["*"]
 	}
-	return ruleSSHUsers["*"]
+	if v == "=" {
+		return reqSSHUser
+	}
+	return v
 }
 
 func matchesPrincipal(ps []*tailcfg.SSHPrincipal, ci *sshConnInfo) bool {
@@ -508,4 +698,171 @@ func matchesPrincipal(ps []*tailcfg.SSHPrincipal, ci *sshConnInfo) bool {
 		}
 	}
 	return false
+}
+
+func randBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// startNewRecording starts a new SSH session recording.
+//
+// It writes an asciinema file to
+// $TAILSCALE_VAR_ROOT/ssh-sessions/ssh-session-<unixtime>-*.cast.
+func (ss *sshSession) startNewRecording() (*recording, error) {
+	var w ssh.Window
+	if ptyReq, _, isPtyReq := ss.Pty(); isPtyReq {
+		w = ptyReq.Window
+	}
+
+	term := envValFromList(ss.Environ(), "TERM")
+	if term == "" {
+		term = "xterm-256color" // something non-empty
+	}
+
+	now := time.Now()
+	rec := &recording{
+		ss:    ss,
+		start: now,
+	}
+	varRoot := ss.srv.lb.TailscaleVarRoot()
+	if varRoot == "" {
+		return nil, errors.New("no var root for recording storage")
+	}
+	dir := filepath.Join(varRoot, "ssh-sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	f, err := ioutil.TempFile(dir, fmt.Sprintf("ssh-session-%v-*.cast", now.UnixNano()))
+	if err != nil {
+		return nil, err
+	}
+	rec.out = f
+
+	// {"version": 2, "width": 221, "height": 84, "timestamp": 1647146075, "env": {"SHELL": "/bin/bash", "TERM": "screen"}}
+	type CastHeader struct {
+		Version   int               `json:"version"`
+		Width     int               `json:"width"`
+		Height    int               `json:"height"`
+		Timestamp int64             `json:"timestamp"`
+		Env       map[string]string `json:"env"`
+	}
+	j, err := json.Marshal(CastHeader{
+		Version:   2,
+		Width:     w.Width,
+		Height:    w.Height,
+		Timestamp: now.Unix(),
+		Env: map[string]string{
+			"TERM": term,
+			// TODO(bradiftz): anything else important?
+			// including all seems noisey, but maybe we should
+			// for auditing. But first need to break
+			// launchProcess's startWithStdPipes and
+			// startWithPTY up so that they first return the cmd
+			// without starting it, and then a step that starts
+			// it. Then we can (1) make the cmd, (2) start the
+			// recording, (3) start the process.
+		},
+	})
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	ss.logf("starting asciinema recording to %s", f.Name())
+	j = append(j, '\n')
+	if _, err := f.Write(j); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return rec, nil
+}
+
+// recording is the state for an SSH session recording.
+type recording struct {
+	ss    *sshSession
+	start time.Time
+
+	mu  sync.Mutex // guards writes to, close of out
+	out *os.File   // nil if closed
+}
+
+func (r *recording) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.out == nil {
+		return nil
+	}
+	err := r.out.Close()
+	r.out = nil
+	return err
+}
+
+// writer returns an io.Writer around w that first records the write.
+//
+// The dir should be "i" for input or "o" for output.
+//
+// If r is nil, it returns w unchanged.
+func (r *recording) writer(dir string, w io.Writer) io.Writer {
+	if r == nil {
+		return w
+	}
+	return &loggingWriter{r, dir, w}
+}
+
+// loggingWriter is an io.Writer wrapper that writes first an
+// asciinema JSON cast format recording line, and then writes to w.
+type loggingWriter struct {
+	r   *recording
+	dir string    // "i" or "o" (input or output)
+	w   io.Writer // underlying Writer, after writing to r.out
+}
+
+func (w loggingWriter) Write(p []byte) (n int, err error) {
+	j, err := json.Marshal([]interface{}{
+		time.Since(w.r.start).Seconds(),
+		w.dir,
+		string(p),
+	})
+	if err != nil {
+		return 0, err
+	}
+	j = append(j, '\n')
+	if err := w.writeCastLine(j); err != nil {
+		return 0, nil
+	}
+	return w.w.Write(p)
+}
+
+func (w loggingWriter) writeCastLine(j []byte) error {
+	w.r.mu.Lock()
+	defer w.r.mu.Unlock()
+	if w.r.out == nil {
+		return errors.New("logger closed")
+	}
+	_, err := w.r.out.Write(j)
+	if err != nil {
+		return fmt.Errorf("logger Write: %w", err)
+	}
+	return nil
+}
+
+func envValFromList(env []string, wantKey string) (v string) {
+	for _, kv := range env {
+		if thisKey, v, ok := strings.Cut(kv, "="); ok && envEq(thisKey, wantKey) {
+			return v
+		}
+	}
+	return ""
+}
+
+// envEq reports whether environment variable a == b for the current
+// operating system.
+func envEq(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

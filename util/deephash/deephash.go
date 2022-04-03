@@ -113,11 +113,11 @@ func (h *hasher) sum() (s Sum) {
 }
 
 var hasherPool = &sync.Pool{
-	New: func() interface{} { return new(hasher) },
+	New: func() any { return new(hasher) },
 }
 
 // Hash returns the hash of v.
-func Hash(v interface{}) (s Sum) {
+func Hash(v any) (s Sum) {
 	h := hasherPool.Get().(*hasher)
 	defer hasherPool.Put(h)
 	h.reset()
@@ -130,7 +130,7 @@ func Hash(v interface{}) (s Sum) {
 }
 
 // Update sets last to the hash of v and reports whether its value changed.
-func Update(last *Sum, v ...interface{}) (changed bool) {
+func Update(last *Sum, v ...any) (changed bool) {
 	sum := Hash(v)
 	if sum == *last {
 		// unchanged.
@@ -304,7 +304,7 @@ type mapHasher struct {
 }
 
 var mapHasherPool = &sync.Pool{
-	New: func() interface{} { return new(mapHasher) },
+	New: func() any { return new(mapHasher) },
 }
 
 type valueCache map[reflect.Type]reflect.Value
@@ -328,19 +328,21 @@ func (c *valueCache) get(t reflect.Type) reflect.Value {
 func (h *hasher) hashMap(v reflect.Value) {
 	mh := mapHasherPool.Get().(*mapHasher)
 	defer mapHasherPool.Put(mh)
-	iter := mapIter(&mh.iter, v)
-	defer mapIter(&mh.iter, reflect.Value{}) // avoid pinning v from mh.iter when we return
+
+	iter := &mh.iter
+	iter.Reset(v)
+	defer iter.Reset(reflect.Value{}) // avoid pinning v from mh.iter when we return
 
 	var sum Sum
 	k := mh.val.get(v.Type().Key())
 	e := mh.val.get(v.Type().Elem())
 	mh.h.visitStack = h.visitStack // always use the parent's visit stack to avoid cycles
 	for iter.Next() {
-		key := iterKey(iter, k)
-		val := iterVal(iter, e)
+		k.SetIterKey(iter)
+		e.SetIterValue(iter)
 		mh.h.reset()
-		mh.h.hashValue(key)
-		mh.h.hashValue(val)
+		mh.h.hashValue(k)
+		mh.h.hashValue(v)
 		sum.xor(mh.h.sum())
 	}
 	h.bw.Write(append(h.scratch[:0], sum.sum[:]...)) // append into scratch to avoid heap allocation

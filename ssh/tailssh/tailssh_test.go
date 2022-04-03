@@ -9,7 +9,6 @@ package tailssh
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -20,13 +19,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tailscale/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/cibuild"
 	"tailscale.com/util/lineread"
 	"tailscale.com/wgengine"
 )
@@ -153,6 +153,18 @@ func TestMatchRule(t *testing.T) {
 			ci:       &sshConnInfo{uprof: &tailcfg.UserProfile{LoginName: "foo@bar.com"}},
 			wantUser: "ubuntu",
 		},
+		{
+			name: "ssh-user-equal",
+			rule: &tailcfg.SSHRule{
+				Action:     someAction,
+				Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+				SSHUsers: map[string]string{
+					"*": "=",
+				},
+			},
+			ci:       &sshConnInfo{sshUser: "alice"},
+			wantUser: "alice",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -211,10 +223,10 @@ func TestSSH(t *testing.T) {
 		uprof:   &tailcfg.UserProfile{},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ss.Handler = func(s ssh.Session) {
-		srv.handleAcceptedSSH(ctx, s, ci, u)
+		ss := srv.newSSHSession(s, ci, u)
+		ss.action = &tailcfg.SSHAction{Accept: true}
+		ss.run()
 	}
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -247,6 +259,9 @@ func TestSSH(t *testing.T) {
 	}
 
 	t.Run("env", func(t *testing.T) {
+		if cibuild.On() {
+			t.Skip("Skipping for now; see https://github.com/tailscale/tailscale/issues/4051")
+		}
 		cmd := execSSH("LANG=foo env")
 		cmd.Env = append(os.Environ(), "LOCAL_ENV=bar")
 		got, err := cmd.CombinedOutput()
@@ -255,9 +270,6 @@ func TestSSH(t *testing.T) {
 		}
 		m := parseEnv(got)
 		if got := m["USER"]; got == "" || got != u.Username {
-			if u.Username == "runner" {
-				t.Skip("Skipping for now; see https://github.com/tailscale/tailscale/issues/4051")
-			}
 			t.Errorf("USER = %q; want %q", got, u.Username)
 		}
 		if got := m["HOME"]; got == "" || got != u.HomeDir {
@@ -292,6 +304,9 @@ func TestSSH(t *testing.T) {
 	})
 
 	t.Run("stdin", func(t *testing.T) {
+		if cibuild.On() {
+			t.Skip("Skipping for now; see https://github.com/tailscale/tailscale/issues/4051")
+		}
 		cmd := execSSH("cat")
 		var outBuf bytes.Buffer
 		cmd.Stdout = &outBuf

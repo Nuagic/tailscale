@@ -454,7 +454,7 @@ func TestDelegate(t *testing.T) {
 	// intend to handle responses this large, so there should be truncation.
 	hugeTXT := generateTXT(64000, randSource)
 
-	records := []interface{}{
+	records := []any{
 		"test.site.",
 		resolveToIP(testipv4, testipv6, "dns.test.site."),
 		"LCtesT.SiTe.",
@@ -965,8 +965,6 @@ func TestAllocs(t *testing.T) {
 	}{
 		// Name lowercasing, response slice created by dns.NewBuilder,
 		// and closure allocation from go call.
-		// (Closure allocation only happens when using new register ABI,
-		// which is amd64 with Go 1.17, and probably more platforms later.)
 		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA, noEdns), 3},
 		// 3 extra allocs in rdnsNameToIPv4 and one in marshalPTRRecord (dns.NewName).
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR, noEdns), 5},
@@ -1107,7 +1105,7 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 		t.Skip("skipping test on Windows; waiting for golang.org/issue/33097")
 	}
 
-	records := []interface{}{
+	records := []any{
 		"no-records.test.",
 		dnsHandler(),
 

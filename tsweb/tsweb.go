@@ -33,10 +33,10 @@ import (
 )
 
 func init() {
-	expvar.Publish("process_start_unix_time", expvar.Func(func() interface{} { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() interface{} { return version.Long }))
-	expvar.Publish("counter_uptime_sec", expvar.Func(func() interface{} { return int64(Uptime().Seconds()) }))
-	expvar.Publish("gauge_goroutines", expvar.Func(func() interface{} { return runtime.NumGoroutine() }))
+	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
+	expvar.Publish("version", expvar.Func(func() any { return version.Long }))
+	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
+	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
 
 // DevMode controls whether extra output in shown, for when the binary is being run in dev mode.
@@ -112,7 +112,13 @@ func Uptime() time.Duration { return time.Since(timeStart).Round(time.Second) }
 // Port80Handler is the handler to be given to
 // autocert.Manager.HTTPHandler.  The inner handler is the mux
 // returned by NewMux containing registered /debug handlers.
-type Port80Handler struct{ Main http.Handler }
+type Port80Handler struct {
+	Main http.Handler
+	// FQDN is used to redirect incoming requests to https://<FQDN>.
+	// If it is not set, the hostname is calculated from the incoming
+	// request.
+	FQDN string
+}
 
 func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.RequestURI
@@ -128,16 +134,12 @@ func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Redirect authorized user to the debug handler.
 		path = "/debug/"
 	}
-	target := "https://" + stripPort(r.Host) + path
-	http.Redirect(w, r, target, http.StatusFound)
-}
-
-func stripPort(hostport string) string {
-	host, _, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return hostport
+	host := h.FQDN
+	if host == "" {
+		host = r.URL.Hostname()
 	}
-	return net.JoinHostPort(host, "443")
+	target := "https://" + host + path
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 // ReturnHandler is like net/http.Handler, but the handler can return an
@@ -347,6 +349,15 @@ func Error(code int, msg string, err error) HTTPError {
 	return HTTPError{Code: code, Msg: msg, Err: err}
 }
 
+// PrometheusVar is a value that knows how to format itself into
+// Prometheus metric syntax.
+type PrometheusVar interface {
+	// WritePrometheus writes the value of the var to w, in Prometheus
+	// metric syntax. All variables names written out must start with
+	// prefix (or write out a single variable named exactly prefix)
+	WritePrometheus(w io.Writer, prefix string)
+}
+
 // WritePrometheusExpvar writes kv to w in Prometheus metrics format.
 //
 // See VarzHandler for conventions. This is exported primarily for
@@ -370,13 +381,16 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	}
 	if strings.HasPrefix(key, "labelmap_") {
 		key = strings.TrimPrefix(key, "labelmap_")
-		if i := strings.Index(key, "_"); i != -1 {
-			label, key = key[:i], key[i+1:]
+		if a, b, ok := strings.Cut(key, "_"); ok {
+			label, key = a, b
 		}
 	}
 	name := prefix + key
 
 	switch v := kv.Value.(type) {
+	case PrometheusVar:
+		v.WritePrometheus(w, name)
+		return
 	case *expvar.Int:
 		if typ == "" {
 			typ = "counter"
@@ -513,7 +527,7 @@ type PrometheusMetricsReflectRooter interface {
 	expvar.Var
 
 	// PrometheusMetricsReflectRoot returns the struct or struct pointer to walk.
-	PrometheusMetricsReflectRoot() interface{}
+	PrometheusMetricsReflectRoot() any
 }
 
 var expvarDo = expvar.Do // pulled out for tests
@@ -541,9 +555,7 @@ func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metric
 		sf := t.Field(i)
 		name := sf.Name
 		if v := sf.Tag.Get("json"); v != "" {
-			if i := strings.Index(v, ","); i != -1 {
-				v = v[:i]
-			}
+			v, _, _ = strings.Cut(v, ",")
 			if v == "-" {
 				// Skip it, regardless of its metrictype.
 				continue
@@ -564,10 +576,10 @@ func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metric
 	}
 }
 
-type expVarPromStructRoot struct{ v interface{} }
+type expVarPromStructRoot struct{ v any }
 
-func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() interface{} { return r.v }
-func (r expVarPromStructRoot) String() string                            { panic("unused") }
+func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() any { return r.v }
+func (r expVarPromStructRoot) String() string                    { panic("unused") }
 
 var (
 	_ PrometheusMetricsReflectRooter = expVarPromStructRoot{}
