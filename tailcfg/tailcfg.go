@@ -65,8 +65,9 @@ type CapabilityVersion int
 //    26: 2022-01-12: (nothing, just bumping for 1.20.0)
 //    27: 2022-02-18: start of SSHPolicy being respected
 //    28: 2022-03-09: client can communicate over Noise.
-//    29: 2022-03-09: MapResponse.PopBrowserURL
-const CurrentCapabilityVersion CapabilityVersion = 29
+//    29: 2022-03-21: MapResponse.PopBrowserURL
+//    30: 2022-03-22: client can request id tokens.
+const CurrentCapabilityVersion CapabilityVersion = 30
 
 type StableID string
 
@@ -452,16 +453,14 @@ type Service struct {
 // Because it contains pointers (slices), this type should not be used
 // as a value type.
 type Hostinfo struct {
-	// TODO(crawshaw): mark all these fields ",omitempty" when all the
-	// iOS apps are updated with the latest swift version of this struct.
 	IPNVersion    string             `json:",omitempty"` // version of this code
 	FrontendLogID string             `json:",omitempty"` // logtail ID of frontend instance
 	BackendLogID  string             `json:",omitempty"` // logtail ID of backend instance
-	OS            string             // operating system the client runs on (a version.OS value)
+	OS            string             `json:",omitempty"` // operating system the client runs on (a version.OS value)
 	OSVersion     string             `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
 	Package       string             `json:",omitempty"` // Tailscale package to disambiguate ("choco", "appstore", etc; "" for unknown)
 	DeviceModel   string             `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone12,3")
-	Hostname      string             // name of the host the client runs on
+	Hostname      string             `json:",omitempty"` // name of the host the client runs on
 	ShieldsUp     bool               `json:",omitempty"` // indicates whether the host is blocking incoming connections
 	ShareeNode    bool               `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
 	GoArch        string             `json:",omitempty"` // the host's GOARCH value (of the running binary)
@@ -1673,4 +1672,43 @@ type OverTLSPublicKeyResponse struct {
 	// Noise-based control plane protocol. (see packages
 	// control/controlbase and control/controlhttp)
 	PublicKey key.MachinePublic `json:"publicKey"`
+}
+
+// TokenRequest is a request to get an OIDC ID token for an audience.
+// The token can be presented to any resource provider which offers OIDC
+// Federation.
+//
+// It is JSON-encoded and sent over Noise to "/machine/id-token".
+type TokenRequest struct {
+	// CapVersion is the client's current CapabilityVersion.
+	CapVersion CapabilityVersion
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+	// Audience the token is being requested for.
+	Audience string
+}
+
+// TokenResponse is the response to a TokenRequest.
+type TokenResponse struct {
+	// IDToken is a JWT encoding the following standard claims:
+	//
+	//   `sub` | the MagicDNS name of the node
+	//   `aud` | Audience from the request
+	//   `exp` | Token expiry
+	//   `iat` | Token issuance time
+	//   `iss` | Issuer
+	//   `jti` | Random token identifier
+	//   `nbf` | Not before time
+	//
+	// It also encodes the following Tailscale specific claims:
+	//
+	//   `key`       | the node public key
+	//   `addresses` | the Tailscale IPs of the node
+	//   `nid`       | the node ID
+	//   `node`      | the name of the node
+	//   `domain`    | the domain of the node, it has the same format as MapResponse.Domain.
+	//   `tags`      | an array of <domain:tag> on the node (like alice.github:tag:foo or example.com:tag:foo)
+	//   `user`      | user emailish (like alice.github:alice@github or example.com:bob@example.com), if not tagged
+	//   `uid`       | user ID, if not tagged
+	IDToken string `json:"id_token"`
 }
