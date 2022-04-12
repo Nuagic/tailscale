@@ -15,9 +15,12 @@ import (
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 )
+
+var debugNetlinkMessages = envknob.Bool("TS_DEBUG_NETLINK")
 
 // unspecifiedMessage is a minimal message implementation that should not
 // be ignored. In general, OS-specific implementations should use better
@@ -35,6 +38,12 @@ type nlConn struct {
 	logf     logger.Logf
 	conn     *netlink.Conn
 	buffered []netlink.Message
+
+	// addrCache maps interface indices to a set of addresses, and is
+	// used to suppress duplicate RTM_NEWADDR messages. It is populated
+	// by RTM_NEWADDR messages and de-populated by RTM_DELADDR. See
+	// issue #4282.
+	addrCache map[uint32]map[netaddr.IP]bool
 }
 
 func newOSMon(logf logger.Logf, m *Mon) (osMon, error) {
@@ -52,7 +61,7 @@ func newOSMon(logf logger.Logf, m *Mon) (osMon, error) {
 		logf("monitor_linux: AF_NETLINK RTMGRP failed, falling back to polling")
 		return newPollingMon(logf, m)
 	}
-	return &nlConn{logf: logf, conn: conn}, nil
+	return &nlConn{logf: logf, conn: conn, addrCache: make(map[uint32]map[netaddr.IP]bool)}, nil
 }
 
 func (c *nlConn) Close() error { return c.conn.Close() }
@@ -82,11 +91,64 @@ func (c *nlConn) Receive() (message, error) {
 			c.logf("failed to parse type %v: %v", msg.Header.Type, err)
 			return unspecifiedMessage{}, nil
 		}
-		return &newAddrMessage{
-			Label:  rmsg.Attributes.Label,
-			Addr:   netaddrIP(rmsg.Attributes.Local),
-			Delete: msg.Header.Type == unix.RTM_DELADDR,
-		}, nil
+
+		nip := netaddrIP(rmsg.Attributes.Address)
+
+		if debugNetlinkMessages {
+			typ := "RTM_NEWADDR"
+			if msg.Header.Type == unix.RTM_DELADDR {
+				typ = "RTM_DELADDR"
+			}
+
+			// label attributes are seemingly only populated for ipv4 addresses in the wild.
+			label := rmsg.Attributes.Label
+			if label == "" {
+				itf, err := net.InterfaceByIndex(int(rmsg.Index))
+				if err == nil {
+					label = itf.Name
+				}
+			}
+
+			c.logf("%s: %s(%d) %s / %s", typ, label, rmsg.Index, rmsg.Attributes.Address, rmsg.Attributes.Local)
+		}
+
+		addrs := c.addrCache[rmsg.Index]
+
+		// Ignore duplicate RTM_NEWADDR messages using c.addrCache to
+		// detect them. See nlConn.addrcache and issue #4282.
+		if msg.Header.Type == unix.RTM_NEWADDR {
+			if addrs == nil {
+				addrs = make(map[netaddr.IP]bool)
+				c.addrCache[rmsg.Index] = addrs
+			}
+
+			if addrs[nip] {
+				if debugNetlinkMessages {
+					c.logf("ignored duplicate RTM_NEWADDR for %s", nip)
+				}
+				return ignoreMessage{}, nil
+			}
+
+			addrs[nip] = true
+		} else { // msg.Header.Type == unix.RTM_DELADDR
+			if addrs != nil {
+				delete(addrs, nip)
+			}
+
+			if len(addrs) == 0 {
+				delete(c.addrCache, rmsg.Index)
+			}
+		}
+
+		nam := &newAddrMessage{
+			IfIndex: rmsg.Index,
+			Addr:    nip,
+			Delete:  msg.Header.Type == unix.RTM_DELADDR,
+		}
+		if debugNetlinkMessages {
+			c.logf("%+v", nam)
+		}
+		return nam, nil
 	case unix.RTM_NEWROUTE, unix.RTM_DELROUTE:
 		typeStr := "RTM_NEWROUTE"
 		if msg.Header.Type == unix.RTM_DELROUTE {
@@ -104,6 +166,11 @@ func (c *nlConn) Receive() (message, error) {
 		if msg.Header.Type == unix.RTM_NEWROUTE &&
 			(rmsg.Attributes.Table == 255 || rmsg.Attributes.Table == 254) &&
 			(dst.IP().IsMulticast() || dst.IP().IsLinkLocalUnicast()) {
+
+			if debugNetlinkMessages {
+				c.logf("%s ignored", typeStr)
+			}
+
 			// Normal Linux route changes on new interface coming up; don't log or react.
 			return ignoreMessage{}, nil
 		}
@@ -126,12 +193,17 @@ func (c *nlConn) Receive() (message, error) {
 			// (Debugging https://github.com/tailscale/tailscale/issues/643)
 			return unspecifiedMessage{}, nil
 		}
-		return &newRouteMessage{
+
+		nrm := &newRouteMessage{
 			Table:   rmsg.Table,
 			Src:     src,
 			Dst:     dst,
 			Gateway: gw,
-		}, nil
+		}
+		if debugNetlinkMessages {
+			c.logf("%+v", nrm)
+		}
+		return nrm, nil
 	case unix.RTM_NEWRULE:
 		// Probably ourselves adding it.
 		return ignoreMessage{}, nil
@@ -147,10 +219,14 @@ func (c *nlConn) Receive() (message, error) {
 			// On `ip -4 rule del pref 5210 table main`, logs:
 			// monitor: ip rule deleted: {Family:2 DstLength:0 SrcLength:0 Tos:0 Table:254 Protocol:0 Scope:0 Type:1 Flags:0 Attributes:{Dst:<nil> Src:<nil> Gateway:<nil> OutIface:0 Priority:5210 Table:254 Mark:4294967295 Expires:<nil> Metrics:<nil> Multipath:[]}}
 		}
-		return ipRuleDeletedMessage{
+		rdm := ipRuleDeletedMessage{
 			table:    rmsg.Table,
 			priority: rmsg.Attributes.Priority,
-		}, nil
+		}
+		if debugNetlinkMessages {
+			c.logf("%+v", rdm)
+		}
+		return rdm, nil
 	default:
 		c.logf("unhandled netlink msg type %+v, %q", msg.Header, msg.Data)
 		return unspecifiedMessage{}, nil
@@ -196,9 +272,9 @@ func (m *newRouteMessage) ignore() bool {
 
 // newAddrMessage is a message for a new address being added.
 type newAddrMessage struct {
-	Delete bool
-	Addr   netaddr.IP
-	Label  string // netlink Label attribute (e.g. "tailscale0")
+	Delete  bool
+	Addr    netaddr.IP
+	IfIndex uint32 // interface index
 }
 
 func (m *newAddrMessage) ignore() bool {
