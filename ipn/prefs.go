@@ -27,7 +27,7 @@ import (
 	"tailscale.com/util/dnsname"
 )
 
-//go:generate go run tailscale.com/cmd/cloner -type=Prefs -output=prefs_clone.go
+//go:generate go run tailscale.com/cmd/cloner -type=Prefs
 
 // DefaultControlURL is the URL base of the control plane
 // ("coordination server") for use when no explicit one is configured.
@@ -428,9 +428,14 @@ func NewPrefs() *Prefs {
 }
 
 // ControlURLOrDefault returns the coordination server's URL base.
-// If not configured, DefaultControlURL is returned instead.
+//
+// If not configured, or if the configured value is a legacy name equivalent to
+// the default, then DefaultControlURL is returned instead.
 func (p *Prefs) ControlURLOrDefault() string {
 	if p.ControlURL != "" {
+		if p.ControlURL != DefaultControlURL && IsLoginServerSynonym(p.ControlURL) {
+			return DefaultControlURL
+		}
 		return p.ControlURL
 	}
 	return DefaultControlURL
@@ -579,10 +584,8 @@ func (p *Prefs) SetExitNodeIP(s string, st *ipnstate.Status) error {
 	return err
 }
 
-// PrefsFromBytes deserializes Prefs from a JSON blob. If
-// enforceDefaults is true, Prefs.RouteAll and Prefs.AllowSingleHosts
-// are forced on.
-func PrefsFromBytes(b []byte, enforceDefaults bool) (*Prefs, error) {
+// PrefsFromBytes deserializes Prefs from a JSON blob.
+func PrefsFromBytes(b []byte) (*Prefs, error) {
 	p := NewPrefs()
 	if len(b) == 0 {
 		return p, nil
@@ -597,10 +600,6 @@ func PrefsFromBytes(b []byte, enforceDefaults bool) (*Prefs, error) {
 		if err != nil {
 			log.Printf("Prefs parse: %v: %v\n", err, b)
 		}
-	}
-	if enforceDefaults {
-		p.RouteAll = true
-		p.AllowSingleHosts = true
 	}
 	return p, err
 }
@@ -620,7 +619,7 @@ func LoadPrefs(filename string) (*Prefs, error) {
 		// to log in again. (better than crashing)
 		return nil, os.ErrNotExist
 	}
-	p, err := PrefsFromBytes(data, false)
+	p, err := PrefsFromBytes(data)
 	if err != nil {
 		return nil, fmt.Errorf("LoadPrefs(%q) decode: %w", filename, err)
 	}

@@ -6,6 +6,8 @@
 package tsaddr
 
 import (
+	"encoding/binary"
+	"errors"
 	"sync"
 
 	"inet.af/netaddr"
@@ -124,6 +126,18 @@ func Tailscale4To6(ipv4 netaddr.IP) netaddr.IP {
 	v4 := ipv4.As4()
 	copy(ret[13:], v4[1:])
 	return netaddr.IPFrom16(ret)
+}
+
+// Tailscale6to4 returns the IPv4 address corresponding to the given
+// tailscale IPv6 address within the 4To6 range. The IPv4 address
+// and true are returned if the given address was in the correct range,
+// false if not.
+func Tailscale6to4(ipv6 netaddr.IP) (netaddr.IP, bool) {
+	if !ipv6.Is6() || !Tailscale4To6Range().Contains(ipv6) {
+		return netaddr.IP{}, false
+	}
+	v6 := ipv6.As16()
+	return netaddr.IPv4(100, v6[13], v6[14], v6[15]), true
 }
 
 func mustPrefix(v *netaddr.IPPrefix, prefix string) {
@@ -279,4 +293,18 @@ func UnmapVia(ip netaddr.IP) netaddr.IP {
 		return netaddr.IPFrom4(*(*[4]byte)(a[12:16]))
 	}
 	return ip
+}
+
+// MapVia returns an IPv6 "via" route for an IPv4 CIDR in a given siteID.
+func MapVia(siteID uint32, v4 netaddr.IPPrefix) (via netaddr.IPPrefix, err error) {
+	if !v4.IP().Is4() {
+		return via, errors.New("want IPv4 CIDR with a site ID")
+	}
+	viaRange16 := TailscaleViaRange().IP().As16()
+	var a [16]byte
+	copy(a[:], viaRange16[:8])
+	binary.BigEndian.PutUint32(a[8:], siteID)
+	ip4a := v4.IP().As4()
+	copy(a[12:], ip4a[:])
+	return netaddr.IPPrefixFrom(netaddr.IPFrom16(a), v4.Bits()+64+32), nil
 }

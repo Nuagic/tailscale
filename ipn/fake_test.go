@@ -5,9 +5,6 @@
 package ipn
 
 import (
-	"time"
-
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 )
@@ -99,17 +96,5 @@ func (b *FakeBackend) SetPrefs(new *Prefs) {
 func (b *FakeBackend) RequestEngineStatus() {
 	if b.notify != nil {
 		b.notify(Notify{Engine: &EngineStatus{}})
-	}
-}
-
-func (b *FakeBackend) FakeExpireAfter(x time.Duration) {
-	if b.notify != nil {
-		b.notify(Notify{NetMap: &netmap.NetworkMap{}})
-	}
-}
-
-func (b *FakeBackend) Ping(ip string, useTSMP bool) {
-	if b.notify != nil {
-		b.notify(Notify{PingResult: &ipnstate.PingResult{}})
 	}
 }

@@ -9,13 +9,19 @@ package tailssh
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/user"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +31,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
+	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/lineread"
@@ -56,14 +63,17 @@ func TestMatchRule(t *testing.T) {
 				Action:      someAction,
 				RuleExpires: timePtr(time.Unix(100, 0)),
 			},
-			ci:      &sshConnInfo{now: time.Unix(200, 0)},
+			ci:      &sshConnInfo{},
 			wantErr: errRuleExpired,
 		},
 		{
 			name: "no-principal",
 			rule: &tailcfg.SSHRule{
 				Action: someAction,
-			},
+				SSHUsers: map[string]string{
+					"*": "ubuntu",
+				}},
+			ci:      &sshConnInfo{},
 			wantErr: errPrincipalMatch,
 		},
 		{
@@ -168,7 +178,11 @@ func TestMatchRule(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, gotUser, err := matchRule(tt.rule, tt.ci)
+			c := &conn{
+				now:  time.Unix(200, 0),
+				info: tt.ci,
+			}
+			got, gotUser, err := c.matchRule(tt.rule, nil)
 			if err != tt.wantErr {
 				t.Errorf("err = %v; want %v", err, tt.wantErr)
 			}
@@ -205,17 +219,19 @@ func TestSSH(t *testing.T) {
 		lb:   lb,
 		logf: logf,
 	}
-	ss, err := srv.newSSHServer()
+	sc, err := srv.newConn()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Remove the auth checks for the test
+	sc.insecureSkipTailscaleAuth = true
 
 	u, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	ci := &sshConnInfo{
+	sc.localUser = u
+	sc.info = &sshConnInfo{
 		sshUser: "test",
 		src:     netaddr.MustParseIPPort("1.2.3.4:32342"),
 		dst:     netaddr.MustParseIPPort("1.2.3.5:22"),
@@ -223,10 +239,8 @@ func TestSSH(t *testing.T) {
 		uprof:   &tailcfg.UserProfile{},
 	}
 
-	ss.Handler = func(s ssh.Session) {
-		ss := srv.newSSHSession(s, ci, u)
-		ss.action = &tailcfg.SSHAction{Accept: true}
-		ss.run()
+	sc.Handler = func(s ssh.Session) {
+		sc.newSSHSession(s, &tailcfg.SSHAction{Accept: true}).run()
 	}
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -245,12 +259,15 @@ func TestSSH(t *testing.T) {
 				}
 				return
 			}
-			go ss.HandleConn(c)
+			go sc.HandleConn(c)
 		}
 	}()
 
 	execSSH := func(args ...string) *exec.Cmd {
 		cmd := exec.Command("ssh",
+			"-F",
+			"none",
+			"-v",
 			"-p", fmt.Sprint(port),
 			"-o", "StrictHostKeyChecking=no",
 			"user@127.0.0.1")
@@ -266,7 +283,7 @@ func TestSSH(t *testing.T) {
 		cmd.Env = append(os.Environ(), "LOCAL_ENV=bar")
 		got, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatal(err, string(got))
 		}
 		m := parseEnv(got)
 		if got := m["USER"]; got == "" || got != u.Username {
@@ -332,4 +349,106 @@ func parseEnv(out []byte) map[string]string {
 		return nil
 	})
 	return e
+}
+
+func TestPublicKeyFetching(t *testing.T) {
+	var reqsTotal, reqsIfNoneMatchHit, reqsIfNoneMatchMiss int32
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32((&reqsTotal), 1)
+		etag := fmt.Sprintf("W/%q", sha256.Sum256([]byte(r.URL.Path)))
+		w.Header().Set("Etag", etag)
+		if v := r.Header.Get("If-None-Match"); v != "" {
+			if v == etag {
+				atomic.AddInt32(&reqsIfNoneMatchHit, 1)
+				w.WriteHeader(304)
+				return
+			}
+			atomic.AddInt32(&reqsIfNoneMatchMiss, 1)
+		}
+		io.WriteString(w, "foo\nbar\n"+string(r.URL.Path)+"\n")
+	}))
+	ts.StartTLS()
+	defer ts.Close()
+	keys := ts.URL
+
+	clock := &tstest.Clock{}
+	srv := &server{
+		pubKeyHTTPClient: ts.Client(),
+		timeNow:          clock.Now,
+	}
+	for i := 0; i < 2; i++ {
+		got, err := srv.fetchPublicKeysURL(keys + "/alice.keys")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"foo", "bar", "/alice.keys"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %q; want %q", got, want)
+		}
+	}
+	if got, want := atomic.LoadInt32(&reqsTotal), int32(1); got != want {
+		t.Errorf("got %d requests; want %d", got, want)
+	}
+	if got, want := atomic.LoadInt32(&reqsIfNoneMatchHit), int32(0); got != want {
+		t.Errorf("got %d etag hits; want %d", got, want)
+	}
+	clock.Advance(5 * time.Minute)
+	got, err := srv.fetchPublicKeysURL(keys + "/alice.keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"foo", "bar", "/alice.keys"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+	if got, want := atomic.LoadInt32(&reqsTotal), int32(2); got != want {
+		t.Errorf("got %d requests; want %d", got, want)
+	}
+	if got, want := atomic.LoadInt32(&reqsIfNoneMatchHit), int32(1); got != want {
+		t.Errorf("got %d etag hits; want %d", got, want)
+	}
+	if got, want := atomic.LoadInt32(&reqsIfNoneMatchMiss), int32(0); got != want {
+		t.Errorf("got %d etag misses; want %d", got, want)
+	}
+
+}
+
+func TestExpandPublicKeyURL(t *testing.T) {
+	c := &conn{
+		info: &sshConnInfo{
+			uprof: &tailcfg.UserProfile{
+				LoginName: "bar@baz.tld",
+			},
+		},
+	}
+	if got, want := c.expandPublicKeyURL("foo"), "foo"; got != want {
+		t.Errorf("basic: got %q; want %q", got, want)
+	}
+	if got, want := c.expandPublicKeyURL("https://example.com/$LOGINNAME_LOCALPART.keys"), "https://example.com/bar.keys"; got != want {
+		t.Errorf("localpart: got %q; want %q", got, want)
+	}
+	if got, want := c.expandPublicKeyURL("https://example.com/keys?email=$LOGINNAME_EMAIL"), "https://example.com/keys?email=bar@baz.tld"; got != want {
+		t.Errorf("email: got %q; want %q", got, want)
+	}
+	c.info = new(sshConnInfo)
+	if got, want := c.expandPublicKeyURL("https://example.com/keys?email=$LOGINNAME_EMAIL"), "https://example.com/keys?email="; got != want {
+		t.Errorf("on empty: got %q; want %q", got, want)
+	}
+}
+
+func TestAcceptEnvPair(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"TERM=x", true},
+		{"term=x", false},
+		{"TERM", false},
+		{"LC_FOO=x", true},
+		{"LD_PRELOAD=naah", false},
+		{"TERM=screen-256color", true},
+	}
+	for _, tt := range tests {
+		if got := acceptEnvPair(tt.in); got != tt.want {
+			t.Errorf("for %q, got %v; want %v", tt.in, got, tt.want)
+		}
+	}
 }

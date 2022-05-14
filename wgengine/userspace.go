@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"reflect"
 	"runtime"
 	"strings"
@@ -44,6 +45,7 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/mak"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
@@ -75,7 +77,7 @@ const (
 	// packetSendRecheckWireguardThreshold controls how long we can go
 	// between packet sends to an IP before checking to see
 	// whether this IP address needs to be added back to the
-	// Wireguard peer oconfig.
+	// WireGuard peer oconfig.
 	packetSendRecheckWireguardThreshold = 1 * time.Minute
 )
 
@@ -134,19 +136,26 @@ type userspaceEngine struct {
 	endpoints           []tailcfg.Endpoint
 	pendOpen            map[flowtrack.Tuple]*pendingOpenFlow // see pendopen.go
 	networkMapCallbacks map[*someHandle]NetworkMapCallback
-	tsIPByIPPort        map[netaddr.IPPort]netaddr.IP          // allows registration of IP:ports as belonging to a certain Tailscale IP for whois lookups
-	pongCallback        map[[8]byte]func(packet.TSMPPongReply) // for TSMP pong responses
+	tsIPByIPPort        map[netaddr.IPPort]netaddr.IP // allows registration of IP:ports as belonging to a certain Tailscale IP for whois lookups
+
+	// pongCallback is the map of response handlers waiting for disco or TSMP
+	// pong callbacks. The map key is a random slice of bytes.
+	pongCallback map[[8]byte]func(packet.TSMPPongReply)
+	// icmpEchoResponseCallback is the map of reponse handlers waiting for ICMP
+	// echo responses. The map key is a random uint32 that is the little endian
+	// value of the ICMP identifer and sequence number concatenated.
+	icmpEchoResponseCallback map[uint32]func()
 
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
 }
 
 // InternalsGetter is implemented by Engines that can export their internals.
 type InternalsGetter interface {
-	GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, ok bool)
+	GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, _ *dns.Manager, ok bool)
 }
 
-func (e *userspaceEngine) GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, ok bool) {
-	return e.tundev, e.magicConn, true
+func (e *userspaceEngine) GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, _ *dns.Manager, ok bool) {
+	return e.tundev, e.magicConn, e.dns, true
 }
 
 // ResolvingEngine is implemented by Engines that have DNS resolvers.
@@ -212,7 +221,7 @@ type Config struct {
 }
 
 func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16) (Engine, error) {
-	logf("Starting userspace wireguard engine (with fake TUN device)")
+	logf("Starting userspace WireGuard engine (with fake TUN device)")
 	return NewUserspaceEngine(logf, Config{
 		ListenPort:    listenPort,
 		RespondToPing: true,
@@ -244,7 +253,7 @@ func IsNetstack(e Engine) bool {
 	if !ok {
 		return false
 	}
-	tw, _, ok := ig.GetInternals()
+	tw, _, _, ok := ig.GetInternals()
 	if !ok {
 		return false
 	}
@@ -362,7 +371,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if conf.RespondToPing {
 		e.tundev.PostFilterIn = echoRespondToAll
 	}
-	e.tundev.PreFilterOut = e.handleLocalPackets
+	e.tundev.PreFilterFromTunToEngine = e.handleLocalPackets
 
 	if envknob.BoolDefaultTrue("TS_DEBUG_CONNECT_FAILURES") {
 		if e.tundev.PreFilterIn != nil {
@@ -386,8 +395,22 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}
 
+	e.tundev.OnICMPEchoResponseReceived = func(p *packet.Parsed) bool {
+		idSeq := p.EchoIDSeq()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		cb := e.icmpEchoResponseCallback[idSeq]
+		if cb == nil {
+			// We didn't swallow it, so let it flow to the host.
+			return false
+		}
+		e.logf("wgengine: got diagnostic ICMP response %02x", idSeq)
+		go cb()
+		return true
+	}
+
 	// wgdev takes ownership of tundev, will close it when closed.
-	e.logf("Creating wireguard device...")
+	e.logf("Creating WireGuard device...")
 	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
 	closePool.addFunc(e.wgdev.Close)
 	closePool.addFunc(func() {
@@ -412,7 +435,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}()
 
-	e.logf("Bringing wireguard device up...")
+	e.logf("Bringing WireGuard device up...")
 	if err := e.wgdev.Up(); err != nil {
 		return nil, fmt.Errorf("wgdev.Up: %w", err)
 	}
@@ -460,9 +483,16 @@ func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
 // tailscaled directly. Other packets are allowed to proceed into the
 // main ACL filter.
 func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-	if verdict := e.handleDNS(p, t); verdict == filter.Drop {
+	// Handle traffic to the service IP.
+	// TODO(tom): Netstack handles this when it is installed. Rip all
+	//            this out once netstack is used on all platforms.
+	switch p.Dst.IP() {
+	case magicDNSIP, magicDNSIPv6:
+		err := e.dns.EnqueuePacket(append([]byte(nil), p.Payload()...), p.IPProto, p.Src, p.Dst)
+		if err != nil {
+			e.logf("dns: enqueue: %v", err)
+		}
 		metricMagicDNSPacketIn.Add(1)
-		// local DNS handled the packet.
 		return filter.Drop
 	}
 
@@ -485,25 +515,14 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 	return filter.Accept
 }
 
-// handleDNS is an outbound pre-filter resolving Tailscale domains.
-func (e *userspaceEngine) handleDNS(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-	switch p.Dst.IP() {
-	case magicDNSIP, magicDNSIPv6:
-		err := e.dns.EnqueuePacket(append([]byte(nil), p.Payload()...), p.IPProto, p.Src, p.Dst)
-		if err != nil {
-			e.logf("dns: enqueue: %v", err)
-		}
-		return filter.Drop
-	default:
-		return filter.Accept
-	}
-}
-
 // pollResolver reads packets from the DNS resolver and injects them inbound.
+//
+// TODO(tom): Remove this fallback path (via NextPacket()) once
+//            all platforms use netstack.
 func (e *userspaceEngine) pollResolver() {
 	for {
 		bs, err := e.dns.NextPacket()
-		if err == resolver.ErrClosed {
+		if errors.Is(err, net.ErrClosed) {
 			return
 		}
 		if err != nil {
@@ -595,12 +614,12 @@ func (e *userspaceEngine) noteRecvActivity(nk key.NodePublic) {
 
 	// If the last activity time jumped a bunch (say, at least
 	// half the idle timeout) then see if we need to reprogram
-	// Wireguard. This could probably be just
+	// WireGuard. This could probably be just
 	// lazyPeerIdleThreshold without the divide by 2, but
 	// maybeReconfigWireguardLocked is cheap enough to call every
 	// couple minutes (just not on every packet).
 	if e.trimmedNodes[nk] {
-		e.logf("wgengine: idle peer %v now active, reconfiguring wireguard", nk.ShortString())
+		e.logf("wgengine: idle peer %v now active, reconfiguring WireGuard", nk.ShortString())
 		e.maybeReconfigWireguardLocked(nil)
 	}
 }
@@ -714,7 +733,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		}
 	}
 
-	e.logf("wgengine: Reconfig: configuring userspace wireguard config (with %d/%d peers)", len(min.Peers), len(full.Peers))
+	e.logf("wgengine: Reconfig: configuring userspace WireGuard config (with %d/%d peers)", len(min.Peers), len(full.Peers))
 	if err := wgcfg.ReconfigDevice(e.wgdev, &min, e.logf); err != nil {
 		e.logf("wgdev.Reconfig: %v", err)
 		return err
@@ -1203,7 +1222,10 @@ func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
 	why := "link-change-minor"
 	if changed {
 		why = "link-change-major"
+		metricNumMajorChanges.Add(1)
 		e.magicConn.Rebind()
+	} else {
+		metricNumMinorChanges.Add(1)
 	}
 	e.magicConn.ReSTUN(why)
 }
@@ -1267,7 +1289,7 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	e.magicConn.UpdateStatus(sb)
 }
 
-func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) Ping(ip netaddr.IP, pingType tailcfg.PingType, cb func(*ipnstate.PingResult)) {
 	res := &ipnstate.PingResult{IP: ip.String()}
 	pip, ok := e.PeerForIP(ip)
 	if !ok {
@@ -1284,15 +1306,14 @@ func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.Pi
 	}
 	peer := pip.Node
 
-	pingType := "disco"
-	if useTSMP {
-		pingType = "TSMP"
-	}
 	e.logf("ping(%v): sending %v ping to %v %v ...", ip, pingType, peer.Key.ShortString(), peer.ComputedName)
-	if useTSMP {
-		e.sendTSMPPing(ip, peer, res, cb)
-	} else {
+	switch pingType {
+	case "disco":
 		e.magicConn.Ping(peer, res, cb)
+	case "TSMP":
+		e.sendTSMPPing(ip, peer, res, cb)
+	case "ICMP":
+		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
 }
 
@@ -1311,6 +1332,55 @@ func (e *userspaceEngine) mySelfIPMatchingFamily(dst netaddr.IP) (src netaddr.IP
 		return netaddr.IP{}, errors.New("no self address in netmap")
 	}
 	return netaddr.IP{}, errors.New("no self address in netmap matching address family")
+}
+
+func (e *userspaceEngine) sendICMPEchoRequest(destIP netaddr.IP, peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+	srcIP, err := e.mySelfIPMatchingFamily(destIP)
+	if err != nil {
+		res.Err = err.Error()
+		cb(res)
+		return
+	}
+	var icmph packet.Header
+	if srcIP.Is4() {
+		icmph = packet.ICMP4Header{
+			IP4Header: packet.IP4Header{
+				IPProto: ipproto.ICMPv4,
+				Src:     srcIP,
+				Dst:     destIP,
+			},
+			Type: packet.ICMP4EchoRequest,
+			Code: packet.ICMP4NoCode,
+		}
+	} else {
+		icmph = packet.ICMP6Header{
+			IP6Header: packet.IP6Header{
+				IPProto: ipproto.ICMPv6,
+				Src:     srcIP,
+				Dst:     destIP,
+			},
+			Type: packet.ICMP6EchoRequest,
+			Code: packet.ICMP6NoCode,
+		}
+	}
+
+	idSeq, payload := packet.ICMPEchoPayload(nil)
+
+	expireTimer := time.AfterFunc(10*time.Second, func() {
+		e.setICMPEchoResponseCallback(idSeq, nil)
+	})
+	t0 := time.Now()
+	e.setICMPEchoResponseCallback(idSeq, func() {
+		expireTimer.Stop()
+		d := time.Since(t0)
+		res.LatencySeconds = d.Seconds()
+		res.NodeIP = destIP.String()
+		res.NodeName = peer.ComputedName
+		cb(res)
+	})
+
+	icmpPing := packet.Generate(icmph, payload)
+	e.tundev.InjectOutbound(icmpPing)
 }
 
 func (e *userspaceEngine) sendTSMPPing(ip netaddr.IP, peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
@@ -1370,6 +1440,16 @@ func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPP
 		delete(e.pongCallback, data)
 	} else {
 		e.pongCallback[data] = cb
+	}
+}
+
+func (e *userspaceEngine) setICMPEchoResponseCallback(idSeq uint32, cb func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cb == nil {
+		delete(e.icmpEchoResponseCallback, idSeq)
+	} else {
+		mak.Set(&e.icmpEchoResponseCallback, idSeq, cb)
 	}
 }
 
@@ -1506,7 +1586,7 @@ func ipInPrefixes(ip netaddr.IP, pp []netaddr.IPPrefix) bool {
 func dnsIPsOverTailscale(dnsCfg *dns.Config, routerCfg *router.Config) (ret []netaddr.IPPrefix) {
 	m := map[netaddr.IP]bool{}
 
-	add := func(resolvers []dnstype.Resolver) {
+	add := func(resolvers []*dnstype.Resolver) {
 		for _, r := range resolvers {
 			ip, err := netaddr.ParseIP(r.Addr)
 			if err != nil {
@@ -1549,6 +1629,9 @@ func (ls fwdDNSLinkSelector) PickLink(ip netaddr.IP) (linkName string) {
 }
 
 var (
-	metricMagicDNSPacketIn = clientmetric.NewGauge("magicdns_packet_in") // for 100.100.100.100
-	metricReflectToOS      = clientmetric.NewGauge("packet_reflect_to_os")
+	metricMagicDNSPacketIn = clientmetric.NewCounter("magicdns_packet_in") // for 100.100.100.100
+	metricReflectToOS      = clientmetric.NewCounter("packet_reflect_to_os")
+
+	metricNumMajorChanges = clientmetric.NewCounter("wgengine_major_changes")
+	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
 )

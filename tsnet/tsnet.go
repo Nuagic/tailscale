@@ -75,6 +75,7 @@ type Server struct {
 	hostname         string
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
+	localClient      *tailscale.LocalClient
 
 	mu        sync.Mutex
 	listeners map[listenKey]*listener
@@ -88,6 +89,17 @@ func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 	return s.dialer.UserDial(ctx, network, address)
+}
+
+// LocalClient returns a LocalClient that speaks to s.
+//
+// It will start the server if it has not been started yet. If the server's
+// already been started successfully, it doesn't return an error.
+func (s *Server) LocalClient() (*tailscale.LocalClient, error) {
+	if err := s.Start(); err != nil {
+		return nil, err
+	}
+	return s.localClient, nil
 }
 
 // Start connects the server to the tailnet.
@@ -105,6 +117,7 @@ func (s *Server) Close() error {
 	s.shutdownCancel()
 	s.lb.Shutdown()
 	s.linkMon.Close()
+	s.dialer.Close()
 	s.localAPIListener.Close()
 
 	s.mu.Lock()
@@ -137,8 +150,9 @@ func (s *Server) start() error {
 	}
 
 	s.rootPath = s.Dir
-	if s.Store != nil && !s.Ephemeral {
-		if _, ok := s.Store.(*mem.Store); !ok {
+	if s.Store != nil {
+		_, isMemStore := s.Store.(*mem.Store)
+		if isMemStore && !s.Ephemeral {
 			return fmt.Errorf("in-memory store is only supported for Ephemeral nodes")
 		}
 	}
@@ -182,12 +196,12 @@ func (s *Server) start() error {
 		return err
 	}
 
-	tunDev, magicConn, ok := eng.(wgengine.InternalsGetter).GetInternals()
+	tunDev, magicConn, dns, ok := eng.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
 		return fmt.Errorf("%T is not a wgengine.InternalsGetter", eng)
 	}
 
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn, s.dialer)
+	ns, err := netstack.Create(logf, tunDev, eng, magicConn, s.dialer, dns)
 	if err != nil {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}
@@ -259,9 +273,7 @@ func (s *Server) start() error {
 	// TODO(maisem): Rename nettest package to remove "test".
 	lal := nettest.Listen("local-tailscaled.sock:80")
 	s.localAPIListener = lal
-
-	// Override the Tailscale client to use the in-process listener.
-	tailscale.TailscaledDialer = lal.Dial
+	s.localClient = &tailscale.LocalClient{Dial: lal.Dial}
 	go func() {
 		if err := http.Serve(lal, lah); err != nil {
 			logf("localapi serve error: %v", err)

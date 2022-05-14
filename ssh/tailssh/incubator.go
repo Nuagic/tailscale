@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// This file contains the code for the incubator process.
-// Taiscaled launches the incubator as the same user as it was launched as.
-// The incbuator then registers a new session with the OS, sets its own UID to
-// the specified `--uid`` and then lauches the requested `--cmd`.
+// This file contains the code for the incubator process.  Taiscaled
+// launches the incubator as the same user as it was launched as.  The
+// incubator then registers a new session with the OS, sets its UID
+// and groups to the specified `--uid`, `--gid` and `--groups`, and
+// then lauches the requested `--cmd`.
 
 //go:build linux || (darwin && !ios)
 // +build linux darwin,!ios
@@ -13,7 +14,6 @@
 package tailssh
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,10 +25,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
+	"github.com/pkg/sftp"
 	"github.com/u-root/u-root/pkg/termios"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
@@ -49,7 +51,7 @@ var ptyName = func(f *os.File) (string, error) {
 // On success, it may return a non-nil close func which must be closed to
 // release the session.
 // See maybeStartLoginSessionLinux.
-var maybeStartLoginSession = func(logf logger.Logf, uid uint32, localUser, remoteUser, remoteHost, tty string) (close func() error, err error) {
+var maybeStartLoginSession = func(logf logger.Logf, ia incubatorArgs) (close func() error, err error) {
 	return nil, nil
 }
 
@@ -58,12 +60,34 @@ var maybeStartLoginSession = func(logf logger.Logf, uid uint32, localUser, remot
 //
 // If ss.srv.tailscaledPath is empty, this method is equivalent to
 // exec.CommandContext.
-func (ss *sshSession) newIncubatorCommand(ctx context.Context, name string, args []string) *exec.Cmd {
-	if ss.srv.tailscaledPath == "" {
-		return exec.CommandContext(ctx, name, args...)
+func (ss *sshSession) newIncubatorCommand() *exec.Cmd {
+	var (
+		name    string
+		args    []string
+		isSFTP  bool
+		isShell bool
+	)
+	switch ss.Subsystem() {
+	case "sftp":
+		isSFTP = true
+	case "":
+		name = loginShell(ss.conn.localUser.Uid)
+		if rawCmd := ss.RawCommand(); rawCmd != "" {
+			args = append(args, "-c", rawCmd)
+		} else {
+			isShell = true
+			args = append(args, "-l") // login shell
+		}
+	default:
+		panic(fmt.Sprintf("unexpected subsystem: %v", ss.Subsystem()))
 	}
-	lu := ss.localUser
-	ci := ss.connInfo
+
+	if ss.conn.srv.tailscaledPath == "" {
+		// TODO(maisem): this doesn't work with sftp
+		return exec.CommandContext(ss.ctx, name, args...)
+	}
+	lu := ss.conn.localUser
+	ci := ss.conn.info
 	remoteUser := ci.uprof.LoginName
 	if len(ci.node.Tags) > 0 {
 		remoteUser = strings.Join(ci.node.Tags, ",")
@@ -73,46 +97,100 @@ func (ss *sshSession) newIncubatorCommand(ctx context.Context, name string, args
 		"be-child",
 		"ssh",
 		"--uid=" + lu.Uid,
+		"--gid=" + lu.Gid,
+		"--groups=" + strings.Join(ss.conn.userGroupIDs, ","),
 		"--local-user=" + lu.Username,
 		"--remote-user=" + remoteUser,
 		"--remote-ip=" + ci.src.IP().String(),
-		"--cmd=" + name,
 		"--has-tty=false", // updated in-place by startWithPTY
 		"--tty-name=",     // updated in-place by startWithPTY
 	}
-	if len(args) > 0 {
-		incubatorArgs = append(incubatorArgs, "--")
-		incubatorArgs = append(incubatorArgs, args...)
-	}
 
-	return exec.CommandContext(ctx, ss.srv.tailscaledPath, incubatorArgs...)
+	if isSFTP {
+		incubatorArgs = append(incubatorArgs, "--sftp")
+	} else {
+		if isShell {
+			incubatorArgs = append(incubatorArgs, "--shell")
+			// Currently (2022-05-09) `login` is only used for shells
+			if lp, err := exec.LookPath("login"); err == nil {
+				incubatorArgs = append(incubatorArgs, "--login-cmd="+lp)
+			}
+		}
+		incubatorArgs = append(incubatorArgs, "--cmd="+name)
+		if len(args) > 0 {
+			incubatorArgs = append(incubatorArgs, "--")
+			incubatorArgs = append(incubatorArgs, args...)
+		}
+	}
+	return exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...)
 }
 
 const debugIncubator = false
+
+type stdRWC struct{}
+
+func (stdRWC) Read(p []byte) (n int, err error) {
+	return os.Stdin.Read(p)
+}
+
+func (stdRWC) Write(b []byte) (n int, err error) {
+	return os.Stdout.Write(b)
+}
+
+func (stdRWC) Close() error {
+	os.Exit(0)
+	return nil
+}
+
+type incubatorArgs struct {
+	uid          uint64
+	gid          int
+	groups       string
+	localUser    string
+	remoteUser   string
+	remoteIP     string
+	ttyName      string
+	hasTTY       bool
+	cmdName      string
+	isSFTP       bool
+	isShell      bool
+	loginCmdPath string
+	cmdArgs      []string
+}
+
+func parseIncubatorArgs(args []string) (a incubatorArgs) {
+	flags := flag.NewFlagSet("", flag.ExitOnError)
+	flags.Uint64Var(&a.uid, "uid", 0, "the uid of local-user")
+	flags.IntVar(&a.gid, "gid", 0, "the gid of local-user")
+	flags.StringVar(&a.groups, "groups", "", "comma-separated list of gids of local-user")
+	flags.StringVar(&a.localUser, "local-user", "", "the user to run as")
+	flags.StringVar(&a.remoteUser, "remote-user", "", "the remote user/tags")
+	flags.StringVar(&a.remoteIP, "remote-ip", "", "the remote Tailscale IP")
+	flags.StringVar(&a.ttyName, "tty-name", "", "the tty name (pts/3)")
+	flags.BoolVar(&a.hasTTY, "has-tty", false, "is the output attached to a tty")
+	flags.StringVar(&a.cmdName, "cmd", "", "the cmd to launch (ignored in sftp mode)")
+	flags.BoolVar(&a.isShell, "shell", false, "is launching a shell (with no cmds)")
+	flags.BoolVar(&a.isSFTP, "sftp", false, "run sftp server (cmd is ignored)")
+	flags.StringVar(&a.loginCmdPath, "login-cmd", "", "the path to `login` cmd")
+	flags.Parse(args)
+	a.cmdArgs = flags.Args()
+	return a
+}
 
 // beIncubator is the entrypoint to the `tailscaled be-child ssh` subcommand.
 // It is responsible for informing the system of a new login session for the user.
 // This is sometimes necessary for mounting home directories and decrypting file
 // systems.
 //
-// Taiscaled launches the incubator as the same user as it was launched as.
-// The incbuator then registers a new session with the OS, sets its own UID to
-// the specified `--uid`` and then lauches the requested `--cmd`.
+// Tailscaled launches the incubator as the same user as it was
+// launched as.  The incubator then registers a new session with the
+// OS, sets its UID and groups to the specified `--uid`, `--gid` and
+// `--groups` and then launches the requested `--cmd`.
 func beIncubator(args []string) error {
-	var (
-		flags      = flag.NewFlagSet("", flag.ExitOnError)
-		uid        = flags.Uint64("uid", 0, "the uid of local-user")
-		localUser  = flags.String("local-user", "", "the user to run as")
-		remoteUser = flags.String("remote-user", "", "the remote user/tags")
-		remoteIP   = flags.String("remote-ip", "", "the remote Tailscale IP")
-		ttyName    = flags.String("tty-name", "", "the tty name (pts/3)")
-		hasTTY     = flags.Bool("has-tty", false, "is the output attached to a tty")
-		cmdName    = flags.String("cmd", "", "the cmd to launch")
-	)
-	if err := flags.Parse(args); err != nil {
-		return err
+	ia := parseIncubatorArgs(args)
+	if ia.isSFTP && ia.isShell {
+		return fmt.Errorf("--sftp and --shell are mutually exclusive")
 	}
-	cmdArgs := flags.Args()
 
 	logf := logger.Discard
 	if debugIncubator {
@@ -123,29 +201,61 @@ func beIncubator(args []string) error {
 	}
 
 	euid := uint64(os.Geteuid())
+	runningAsRoot := euid == 0
+	if runningAsRoot && ia.isShell && ia.loginCmdPath != "" {
+		// If we are trying to launch a login shell, just exec into login instead.
+		return unix.Exec(ia.loginCmdPath, []string{ia.loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}, os.Environ())
+	}
+
 	// Inform the system that we are about to log someone in.
 	// We can only do this if we are running as root.
 	// This is best effort to still allow running on machines where
-	// we don't support starting session, e.g. darwin.
-	sessionCloser, err := maybeStartLoginSession(logf, uint32(*uid), *localUser, *remoteUser, *remoteIP, *ttyName)
+	// we don't support starting sessions, e.g. darwin.
+	sessionCloser, err := maybeStartLoginSession(logf, ia)
 	if err == nil && sessionCloser != nil {
 		defer sessionCloser()
 	}
-	if euid != *uid {
-		// Switch users if required before starting the desired process.
-		if err := syscall.Setuid(int(*uid)); err != nil {
+	var groupIDs []int
+	for _, g := range strings.Split(ia.groups, ",") {
+		gid, err := strconv.ParseInt(g, 10, 32)
+		if err != nil {
+			return err
+		}
+		groupIDs = append(groupIDs, int(gid))
+	}
+	if err := syscall.Setgroups(groupIDs); err != nil {
+		return err
+	}
+	if egid := os.Getegid(); egid != ia.gid {
+		if err := syscall.Setgid(int(ia.gid)); err != nil {
 			logf(err.Error())
 			os.Exit(1)
 		}
 	}
+	if euid != ia.uid {
+		// Switch users if required before starting the desired process.
+		if err := syscall.Setuid(int(ia.uid)); err != nil {
+			logf(err.Error())
+			os.Exit(1)
+		}
+	}
+	if ia.isSFTP {
+		logf("handling sftp")
 
-	cmd := exec.Command(*cmdName, cmdArgs...)
+		server, err := sftp.NewServer(stdRWC{})
+		if err != nil {
+			return err
+		}
+		return server.Serve()
+	}
+
+	cmd := exec.Command(ia.cmdName, ia.cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 
-	if *hasTTY {
+	if ia.hasTTY {
 		// If we were launched with a tty then we should
 		// mark that as the ctty of the child. However,
 		// as the ctty is being passed from the parent
@@ -165,26 +275,23 @@ func beIncubator(args []string) error {
 // The caller can wait for the process to exit by calling cmd.Wait().
 //
 // It sets ss.cmd, stdin, stdout, and stderr.
-func (ss *sshSession) launchProcess(ctx context.Context) error {
-	shell := loginShell(ss.localUser.Uid)
-	var args []string
-	if rawCmd := ss.RawCommand(); rawCmd != "" {
-		args = append(args, "-c", rawCmd)
-	} else {
-		args = append(args, "-l") // login shell
+func (ss *sshSession) launchProcess() error {
+	ss.cmd = ss.newIncubatorCommand()
+
+	cmd := ss.cmd
+	cmd.Dir = ss.conn.localUser.HomeDir
+	cmd.Env = append(cmd.Env, envForUser(ss.conn.localUser)...)
+	for _, kv := range ss.Environ() {
+		if acceptEnvPair(kv) {
+			cmd.Env = append(cmd.Env, kv)
+		}
 	}
 
-	ci := ss.connInfo
-	cmd := ss.newIncubatorCommand(ctx, shell, args)
-	cmd.Dir = ss.localUser.HomeDir
-	cmd.Env = append(cmd.Env, envForUser(ss.localUser)...)
-	cmd.Env = append(cmd.Env, ss.Environ()...)
+	ci := ss.conn.info
 	cmd.Env = append(cmd.Env,
 		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.IP(), ci.src.Port(), ci.dst.Port()),
 		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.IP(), ci.src.Port(), ci.dst.IP(), ci.dst.Port()),
 	)
-
-	ss.cmd = cmd
 
 	if ss.agentListener != nil {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", ss.agentListener.Addr()))
@@ -196,7 +303,6 @@ func (ss *sshSession) launchProcess(ctx context.Context) error {
 		return ss.startWithStdPipes()
 	}
 	ss.ptyReq = &ptyReq
-	ss.logf("starting pty command: %+v", cmd.Args)
 	pty, err := ss.startWithPTY()
 	if err != nil {
 		return err
@@ -217,7 +323,7 @@ func resizeWindow(f *os.File, winCh <-chan ssh.Window) {
 }
 
 // opcodeShortName is a mapping of SSH opcode
-// to mnemonic names expected by the termios packaage.
+// to mnemonic names expected by the termios package.
 // These are meant to be platform independent.
 var opcodeShortName = map[uint8]string{
 	gossh.VINTR:         "intr",
@@ -330,7 +436,7 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 			}
 			k, ok := opcodeShortName[c]
 			if !ok {
-				ss.logf("unknown opcode: %d", c)
+				ss.vlogf("unknown opcode: %d", c)
 				continue
 			}
 			if _, ok := tios.CC[k]; ok {
@@ -341,7 +447,7 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 				tios.Opts[k] = v > 0
 				continue
 			}
-			ss.logf("unsupported opcode: %v(%d)=%v", k, c, v)
+			ss.vlogf("unsupported opcode: %v(%d)=%v", k, c, v)
 		}
 
 		// Save PTY settings.
@@ -373,6 +479,7 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 	cmd.Stdout = tty
 	cmd.Stderr = tty
 
+	ss.logf("starting pty command: %+v", cmd.Args)
 	if err = cmd.Start(); err != nil {
 		return
 	}
@@ -430,7 +537,7 @@ func loginShell(uid string) string {
 	if e := os.Getenv("SHELL"); e != "" {
 		return e
 	}
-	return "/bin/bash"
+	return "/bin/sh"
 }
 
 func envForUser(u *user.User) []string {
@@ -450,4 +557,15 @@ func updateStringInSlice(ss []string, a, b string) {
 			return
 		}
 	}
+}
+
+// acceptEnvPair reports whether the environment variable key=value pair
+// should be accepted from the client. It uses the same default as OpenSSH
+// AcceptEnv.
+func acceptEnvPair(kv string) bool {
+	k, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return false
+	}
+	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
 }

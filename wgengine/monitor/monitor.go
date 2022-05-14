@@ -42,6 +42,10 @@ type osMon interface {
 	// until the osMon is closed. After a Close, the returned
 	// error is ignored.
 	Receive() (message, error)
+
+	// IsInterestingInterface reports whether the provided interface should
+	// be considered for network change events.
+	IsInterestingInterface(iface string) bool
 }
 
 // ChangeFunc is a callback function that's called when the network
@@ -185,13 +189,7 @@ func (m *Mon) Start() {
 	}
 	m.started = true
 
-	switch runtime.GOOS {
-	case "ios", "android":
-		// For battery reasons, and because these platforms
-		// don't really sleep in the same way, don't poll
-		// for the wall time to detect for wake-for-sleep
-		// walltime jumps.
-	default:
+	if shouldMonitorTimeJump {
 		m.wallTimer = time.AfterFunc(pollWallTimeInterval, m.pollWallTime)
 	}
 
@@ -288,6 +286,13 @@ func (m *Mon) notifyRuleDeleted(rdm ipRuleDeletedMessage) {
 	}
 }
 
+// isInterestingInterface reports whether the provided interface should be
+// considered when checking for network state changes.
+// The ips parameter should be the IPs of the provided interface.
+func (m *Mon) isInterestingInterface(i interfaces.Interface, ips []netaddr.IPPrefix) bool {
+	return m.om.IsInterestingInterface(i.Name) && interfaces.UseInterestingInterfaces(i, ips)
+}
+
 // debounce calls the callback function with a delay between events
 // and exits when a stop is issued.
 func (m *Mon) debounce() {
@@ -304,27 +309,26 @@ func (m *Mon) debounce() {
 		} else {
 			m.mu.Lock()
 
-			// See if we have a queued or new time jump signal.
-			m.checkWallTimeAdvanceLocked()
-			timeJumped := m.timeJumped
-			if timeJumped {
-				m.logf("time jumped (probably wake from sleep); synthesizing major change event")
-			}
-
 			oldState := m.ifState
-			ifChanged := !curState.EqualFiltered(oldState, interfaces.UseInterestingInterfaces, interfaces.UseInterestingIPs)
-			if ifChanged {
+			changed := !curState.EqualFiltered(oldState, m.isInterestingInterface, interfaces.UseInterestingIPs)
+			if changed {
 				m.gwValid = false
 				m.ifState = curState
 
 				if s1, s2 := oldState.String(), curState.String(); s1 == s2 {
-					m.logf("[unexpected] network state changed, but stringification didn't: %v\nold: %s\nnew: %s\n", s1,
-						jsonSummary(oldState), jsonSummary(curState))
+					m.logf("[unexpected] network state changed, but stringification didn't: %v", s1)
+					m.logf("[unexpected] old: %s", jsonSummary(oldState))
+					m.logf("[unexpected] new: %s", jsonSummary(curState))
 				}
 			}
-			changed := ifChanged || timeJumped
-			if changed {
-				m.timeJumped = false
+			// See if we have a queued or new time jump signal.
+			if shouldMonitorTimeJump && m.checkWallTimeAdvanceLocked() {
+				m.resetTimeJumpedLocked()
+				if !changed {
+					// Only log if it wasn't an interesting change.
+					m.logf("time jumped (probably wake from sleep); synthesizing major change event")
+					changed = true
+				}
 			}
 			for _, cb := range m.cbs {
 				go cb(changed, m.ifState)
@@ -360,22 +364,37 @@ func (m *Mon) pollWallTime() {
 	if m.closed {
 		return
 	}
-	m.checkWallTimeAdvanceLocked()
-	if m.timeJumped {
+	if m.checkWallTimeAdvanceLocked() {
 		m.InjectEvent()
 	}
 	m.wallTimer.Reset(pollWallTimeInterval)
 }
 
-// checkWallTimeAdvanceLocked updates m.timeJumped, if wall time jumped
-// more than 150% of pollWallTimeInterval, indicating we probably just
-// came out of sleep.
-func (m *Mon) checkWallTimeAdvanceLocked() {
+// shouldMonitorTimeJump is whether we keep a regular periodic timer running in
+// the background watching for jumps in wall time.
+//
+// We don't do this on mobile platforms for battery reasons, and because these
+// platforms don't really sleep in the same way.
+const shouldMonitorTimeJump = runtime.GOOS != "android" && runtime.GOOS != "ios"
+
+// checkWallTimeAdvanceLocked reports whether wall time jumped more than 150% of
+// pollWallTimeInterval, indicating we probably just came out of sleep. Once a
+// time jump is detected it must be reset by calling resetTimeJumpedLocked.
+func (m *Mon) checkWallTimeAdvanceLocked() bool {
+	if !shouldMonitorTimeJump {
+		panic("unreachable") // if callers are correct
+	}
 	now := wallTime()
 	if now.Sub(m.lastWall) > pollWallTimeInterval*3/2 {
-		m.timeJumped = true
+		m.timeJumped = true // it is reset by debounce.
 	}
 	m.lastWall = now
+	return m.timeJumped
+}
+
+// resetTimeJumpedLocked consumes the signal set by checkWallTimeAdvanceLocked.
+func (m *Mon) resetTimeJumpedLocked() {
+	m.timeJumped = false
 }
 
 type ipRuleDeletedMessage struct {

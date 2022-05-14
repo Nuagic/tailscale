@@ -27,7 +27,6 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
-	"tailscale.com/types/ipproto"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/monitor"
 )
@@ -234,11 +233,7 @@ func unpackResponse(payload []byte) (dnsResponse, error) {
 }
 
 func syncRespond(r *Resolver, query []byte) ([]byte, error) {
-	if err := r.enqueueRequest(query, ipproto.UDP, netaddr.IPPort{}, magicDNSv4Port); err != nil {
-		return nil, fmt.Errorf("enqueueRequest: %w", err)
-	}
-	payload, _, err := r.nextResponse()
-	return payload, err
+	return r.Query(context.Background(), query, netaddr.IPPort{})
 }
 
 func mustIP(str string) netaddr.IP {
@@ -348,6 +343,9 @@ func TestResolveLocal(t *testing.T) {
 		{"ns-nxdomain", "test3.ipn.dev.", dns.TypeNS, netaddr.IP{}, dns.RCodeNameError},
 		{"onion-domain", "footest.onion.", dns.TypeA, netaddr.IP{}, dns.RCodeNameError},
 		{"magicdns", dnsSymbolicFQDN, dns.TypeA, netaddr.MustParseIP("100.100.100.100"), dns.RCodeSuccess},
+		{"via_hex", dnsname.FQDN("via-0xff.1.2.3.4."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:ff:102:304"), dns.RCodeSuccess},
+		{"via_dec", dnsname.FQDN("via-1.10.0.0.1."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:1:a00:1"), dns.RCodeSuccess},
+		{"via_invalid", dnsname.FQDN("via-."), dns.TypeA, netaddr.IP{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -382,6 +380,7 @@ func TestResolveLocalReverse(t *testing.T) {
 		{"ipv6_nxdomain", dnsname.FQDN("0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.ip6.arpa."), "", dns.RCodeNameError},
 		{"nxdomain", dnsname.FQDN("2.3.4.5.in-addr.arpa."), "", dns.RCodeRefused},
 		{"magicdns", dnsname.FQDN("100.100.100.100.in-addr.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
+		{"ipv6_4to6", dnsname.FQDN("4.6.4.6.4.6.2.6.6.9.d.c.3.4.8.4.2.1.b.a.0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
 	}
 
 	for _, tt := range tests {
@@ -481,10 +480,10 @@ func TestDelegate(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {
-			dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
-			dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
 		},
 	}
 	r.SetConfig(cfg)
@@ -656,7 +655,7 @@ func TestDelegateSplitRoute(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".":      {{Addr: server1.PacketConn.LocalAddr().String()}},
 		"other.": {{Addr: server2.PacketConn.LocalAddr().String()}},
 	}
@@ -701,75 +700,6 @@ func TestDelegateSplitRoute(t *testing.T) {
 				t.Errorf("name = %v; want %v", response.name, tt.response.name)
 			}
 		})
-	}
-}
-
-func TestDelegateCollision(t *testing.T) {
-	server := serveDNS(t, "127.0.0.1:0",
-		"test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
-	defer server.Shutdown()
-
-	r := newResolver(t)
-	defer r.Close()
-
-	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
-		".": {{Addr: server.PacketConn.LocalAddr().String()}},
-	}
-	r.SetConfig(cfg)
-
-	packets := []struct {
-		qname dnsname.FQDN
-		qtype dns.Type
-		addr  netaddr.IPPort
-	}{
-		{"test.site.", dns.TypeA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1001)},
-		{"test.site.", dns.TypeAAAA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1002)},
-	}
-
-	// packets will have the same dns txid.
-	for _, p := range packets {
-		payload := dnspacket(p.qname, p.qtype, noEdns)
-		err := r.enqueueRequest(payload, ipproto.UDP, p.addr, magicDNSv4Port)
-		if err != nil {
-			t.Error(err)
-		}
-	}
-
-	// Despite the txid collision, the answer(s) should still match the query.
-	resp, addr, err := r.nextResponse()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var p dns.Parser
-	_, err = p.Start(resp)
-	if err != nil {
-		t.Error(err)
-	}
-	err = p.SkipAllQuestions()
-	if err != nil {
-		t.Error(err)
-	}
-	ans, err := p.AllAnswers()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var wantType dns.Type
-	switch ans[0].Body.(type) {
-	case *dns.AResource:
-		wantType = dns.TypeA
-	case *dns.AAAAResource:
-		wantType = dns.TypeAAAA
-	default:
-		t.Errorf("unexpected answer type: %T", ans[0].Body)
-	}
-
-	for _, p := range packets {
-		if p.qtype == wantType && p.addr != addr {
-			t.Errorf("addr = %v; want %v", addr, p.addr)
-		}
 	}
 }
 
@@ -1017,7 +947,7 @@ func BenchmarkFull(b *testing.B) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {{Addr: server.PacketConn.LocalAddr().String()}},
 	}
 
@@ -1069,7 +999,7 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	fwd := newForwarder(t.Logf, nil, nil, linkSelFunc(func(ip netaddr.IP) string {
+	fwd := newForwarder(t.Logf, nil, linkSelFunc(func(ip netaddr.IP) string {
 		if ip == netaddr.IPv4(1, 2, 3, 4) {
 			return "special"
 		}

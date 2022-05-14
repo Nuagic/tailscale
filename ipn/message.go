@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"time"
 
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/structs"
@@ -51,15 +51,6 @@ type SetPrefsArgs struct {
 	New *Prefs
 }
 
-type FakeExpireAfterArgs struct {
-	Duration time.Duration
-}
-
-type PingArgs struct {
-	IP      string
-	UseTSMP bool
-}
-
 // Command is a command message that is JSON encoded and sent by a
 // frontend to a backend.
 type Command struct {
@@ -82,8 +73,6 @@ type Command struct {
 	SetPrefs              *SetPrefsArgs
 	RequestEngineStatus   *NoArgs
 	RequestStatus         *NoArgs
-	FakeExpireAfter       *FakeExpireAfterArgs
-	Ping                  *PingArgs
 }
 
 type BackendServer struct {
@@ -116,7 +105,7 @@ func (bs *BackendServer) send(n Notify) {
 	if bs.sendNotifyMsg == nil {
 		return
 	}
-	n.Version = version.Long
+	n.Version = ipcVersion
 	bs.sendNotifyMsg(n)
 }
 
@@ -153,9 +142,9 @@ func (bs *BackendServer) GotCommandMsg(ctx context.Context, b []byte) error {
 const ErrMsgPermissionDenied = "permission denied"
 
 func (bs *BackendServer) GotCommand(ctx context.Context, cmd *Command) error {
-	if cmd.Version != version.Long && !cmd.AllowVersionSkew {
+	if cmd.Version != ipcVersion && !cmd.AllowVersionSkew {
 		vs := fmt.Sprintf("GotCommand: Version mismatch! frontend=%#v backend=%#v",
-			cmd.Version, version.Long)
+			cmd.Version, ipcVersion)
 		bs.logf("%s", vs)
 		// ignore the command, but send a message back to the
 		// caller so it can realize the version mismatch too.
@@ -174,9 +163,6 @@ func (bs *BackendServer) GotCommand(ctx context.Context, cmd *Command) error {
 	// Actions permitted with a read-only context:
 	if c := cmd.RequestEngineStatus; c != nil {
 		bs.b.RequestEngineStatus()
-		return nil
-	} else if c := cmd.Ping; c != nil {
-		bs.b.Ping(c.IP, c.UseTSMP)
 		return nil
 	}
 
@@ -204,9 +190,6 @@ func (bs *BackendServer) GotCommand(ctx context.Context, cmd *Command) error {
 	} else if c := cmd.SetPrefs; c != nil {
 		bs.b.SetPrefs(c.New)
 		return nil
-	} else if c := cmd.FakeExpireAfter; c != nil {
-		bs.b.FakeExpireAfter(c.Duration)
-		return nil
 	}
 	return fmt.Errorf("BackendServer.Do: no command specified")
 }
@@ -228,6 +211,19 @@ func NewBackendClient(logf logger.Logf, sendCommandMsg func(jsonb []byte)) *Back
 	}
 }
 
+// IPCVersion returns version.Long usually, unless TS_DEBUG_FAKE_IPC_VERSION is
+// set, in which it contains that value. This is only used for weird development
+// cases when testing mismatched versions and you want the client to act like it's
+// compatible with the server.
+func IPCVersion() string {
+	if v := envknob.String("TS_DEBUG_FAKE_IPC_VERSION"); v != "" {
+		return v
+	}
+	return version.Long
+}
+
+var ipcVersion = IPCVersion()
+
 func (bc *BackendClient) GotNotifyMsg(b []byte) {
 	if len(b) == 0 {
 		// not interesting
@@ -240,9 +236,9 @@ func (bc *BackendClient) GotNotifyMsg(b []byte) {
 	if err := json.Unmarshal(b, &n); err != nil {
 		log.Fatalf("BackendClient.Notify: cannot decode message (length=%d, %#q): %v", len(b), b, err)
 	}
-	if n.Version != version.Long && !bc.AllowVersionSkew {
+	if n.Version != ipcVersion && !bc.AllowVersionSkew {
 		vs := fmt.Sprintf("GotNotify: Version mismatch! frontend=%#v backend=%#v",
-			version.Long, n.Version)
+			ipcVersion, n.Version)
 		bc.logf("%s", vs)
 		// delete anything in the notification except the version,
 		// to prevent incorrect operation.
@@ -257,7 +253,7 @@ func (bc *BackendClient) GotNotifyMsg(b []byte) {
 }
 
 func (bc *BackendClient) send(cmd Command) {
-	cmd.Version = version.Long
+	cmd.Version = ipcVersion
 	b, err := json.Marshal(cmd)
 	if err != nil {
 		log.Fatalf("Failed json.Marshal(cmd): %v\n", err)
@@ -304,17 +300,6 @@ func (bc *BackendClient) RequestEngineStatus() {
 
 func (bc *BackendClient) RequestStatus() {
 	bc.send(Command{AllowVersionSkew: true, RequestStatus: &NoArgs{}})
-}
-
-func (bc *BackendClient) FakeExpireAfter(x time.Duration) {
-	bc.send(Command{FakeExpireAfter: &FakeExpireAfterArgs{Duration: x}})
-}
-
-func (bc *BackendClient) Ping(ip string, useTSMP bool) {
-	bc.send(Command{Ping: &PingArgs{
-		IP:      ip,
-		UseTSMP: useTSMP,
-	}})
 }
 
 // MaxMessageSize is the maximum message size, in bytes.

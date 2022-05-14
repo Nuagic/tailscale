@@ -117,8 +117,8 @@ func (e *watchdogEngine) DiscoPublicKey() (k key.DiscoPublic) {
 	e.watchdog("DiscoPublicKey", func() { k = e.wrap.DiscoPublicKey() })
 	return k
 }
-func (e *watchdogEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.PingResult)) {
-	e.watchdog("Ping", func() { e.wrap.Ping(ip, useTSMP, cb) })
+func (e *watchdogEngine) Ping(ip netaddr.IP, pingType tailcfg.PingType, cb func(*ipnstate.PingResult)) {
+	e.watchdog("Ping", func() { e.wrap.Ping(ip, pingType, cb) })
 }
 func (e *watchdogEngine) RegisterIPPortIdentity(ipp netaddr.IPPort, tsIP netaddr.IP) {
 	e.watchdog("RegisterIPPortIdentity", func() { e.wrap.RegisterIPPortIdentity(ipp, tsIP) })
@@ -133,7 +133,7 @@ func (e *watchdogEngine) WhoIsIPPort(ipp netaddr.IPPort) (tsIP netaddr.IP, ok bo
 func (e *watchdogEngine) Close() {
 	e.watchdog("Close", e.wrap.Close)
 }
-func (e *watchdogEngine) GetInternals() (tw *tstun.Wrapper, c *magicsock.Conn, ok bool) {
+func (e *watchdogEngine) GetInternals() (tw *tstun.Wrapper, c *magicsock.Conn, d *dns.Manager, ok bool) {
 	if ig, ok := e.wrap.(InternalsGetter); ok {
 		return ig.GetInternals()
 	}

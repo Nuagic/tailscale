@@ -54,6 +54,7 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/netconv"
 	"tailscale.com/util/uniq"
 	"tailscale.com/version"
@@ -438,11 +439,7 @@ func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, derpID int, dc *derphttp
 func (c *Conn) addDerpPeerRoute(peer key.NodePublic, derpID int, dc *derphttp.Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.derpRoute == nil {
-		c.derpRoute = make(map[key.NodePublic]derpRoute)
-	}
-	r := derpRoute{derpID, dc}
-	c.derpRoute[peer] = r
+	mak.Set(&c.derpRoute, peer, derpRoute{derpID, dc})
 }
 
 // DerpMagicIP is a fake WireGuard endpoint IP address that means
@@ -496,7 +493,7 @@ type Options struct {
 	// whenever it receives a packet from a a peer if it's been more
 	// than ~10 seconds since the last one. (10 seconds is somewhat
 	// arbitrary; the sole user just doesn't need or want it called on
-	// every packet, just every minute or two for Wireguard timeouts,
+	// every packet, just every minute or two for WireGuard timeouts,
 	// and 10 seconds seems like a good trade-off between often enough
 	// and not too often.)
 	// The provided func is likely to call back into
@@ -606,6 +603,7 @@ func (c *Conn) stopPeriodicReSTUNTimerLocked() {
 
 // c.mu must NOT be held.
 func (c *Conn) updateEndpoints(why string) {
+	metricUpdateEndpoints.Add(1)
 	defer func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1050,8 +1048,8 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		}, nil
 	}
 
-	already := make(map[netaddr.IPPort]tailcfg.EndpointType) // endpoint -> how it was found
-	var eps []tailcfg.Endpoint                               // unique endpoints
+	var already map[netaddr.IPPort]tailcfg.EndpointType // endpoint -> how it was found
+	var eps []tailcfg.Endpoint                          // unique endpoints
 
 	ipp := func(s string) (ipp netaddr.IPPort) {
 		ipp, _ = netaddr.ParseIPPort(s)
@@ -1062,7 +1060,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 			return
 		}
 		if _, ok := already[ipp]; !ok {
-			already[ipp] = et
+			mak.Set(&already, ipp, et)
 			eps = append(eps, tailcfg.Endpoint{Addr: ipp, Type: et})
 		}
 	}
@@ -1866,7 +1864,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort, derpNodeSrc ke
 	}
 
 	// If the first four parts are the prefix of disco.Magic
-	// (0x5453f09f) then it's definitely not a valid Wireguard
+	// (0x5453f09f) then it's definitely not a valid WireGuard
 	// packet (which starts with little-endian uint32 1, 2, 3, 4).
 	// Use naked returns for all following paths.
 	isDiscoMsg = true
@@ -2771,6 +2769,7 @@ func (c *Conn) ReSTUN(why string) {
 		// raced with a shutdown.
 		return
 	}
+	metricReSTUNCalls.Add(1)
 
 	// If the user stopped the app, stop doing work. (When the
 	// user stops Tailscale via the GUI apps, ipn/local.go
@@ -2920,6 +2919,7 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 // Rebind closes and re-binds the UDP sockets and resets the DERP connection.
 // It should be followed by a call to ReSTUN.
 func (c *Conn) Rebind() {
+	metricRebindCalls.Add(1)
 	if err := c.rebind(keepCurrentPort); err != nil {
 		c.logf("%w", err)
 		return
@@ -3957,9 +3957,6 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	for ep := range de.isCallMeMaybeEP {
 		de.isCallMeMaybeEP[ep] = false // mark for deletion
 	}
-	if de.isCallMeMaybeEP == nil {
-		de.isCallMeMaybeEP = map[netaddr.IPPort]bool{}
-	}
 	var newEPs []netaddr.IPPort
 	for _, ep := range m.MyNumber {
 		if ep.IP().Is6() && ep.IP().IsLinkLocalUnicast() {
@@ -3968,7 +3965,7 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 			// for these.
 			continue
 		}
-		de.isCallMeMaybeEP[ep] = true
+		mak.Set(&de.isCallMeMaybeEP, ep, true)
 		if es, ok := de.endpointState[ep]; ok {
 			es.callMeMaybeTime = now
 		} else {
@@ -4144,6 +4141,10 @@ var (
 	metricNumPeers     = clientmetric.NewGauge("magicsock_netmap_num_peers")
 	metricNumDERPConns = clientmetric.NewGauge("magicsock_num_derp_conns")
 
+	metricRebindCalls     = clientmetric.NewCounter("magicsock_rebind_calls")
+	metricReSTUNCalls     = clientmetric.NewCounter("magicsock_restun_calls")
+	metricUpdateEndpoints = clientmetric.NewCounter("magicsock_update_endpoints")
+
 	// Sends (data or disco)
 	metricSendDERPQueued      = clientmetric.NewCounter("magicsock_send_derp_queued")
 	metricSendDERPErrorChan   = clientmetric.NewCounter("magicsock_send_derp_error_chan")
@@ -4157,7 +4158,6 @@ var (
 	// Data packets (non-disco)
 	metricSendData            = clientmetric.NewCounter("magicsock_send_data")
 	metricSendDataNetworkDown = clientmetric.NewCounter("magicsock_send_data_network_down")
-	metricRecvData            = clientmetric.NewCounter("magicsock_recv_data")
 	metricRecvDataDERP        = clientmetric.NewCounter("magicsock_recv_data_derp")
 	metricRecvDataIPv4        = clientmetric.NewCounter("magicsock_recv_data_ipv4")
 	metricRecvDataIPv6        = clientmetric.NewCounter("magicsock_recv_data_ipv6")

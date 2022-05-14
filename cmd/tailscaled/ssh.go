@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !hermetic
-// +build !hermetic
+//go:build linux || darwin
+// +build linux darwin
 
-package dnsfallback
+package main
 
-//go:generate go run update-dns-fallbacks.go
+// Force registration of tailssh with LocalBackend.
+import _ "tailscale.com/ssh/tailssh"

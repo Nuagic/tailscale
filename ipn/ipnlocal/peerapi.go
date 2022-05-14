@@ -29,6 +29,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/kortschak/wol"
 	"golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
@@ -386,6 +387,14 @@ func (s *peerAPIServer) OpenFile(baseName string) (rc io.ReadCloser, size int64,
 }
 
 func (s *peerAPIServer) listen(ip netaddr.IP, ifState *interfaces.State) (ln net.Listener, err error) {
+	// Android for whatever reason often has problems creating the peerapi listener.
+	// But since we started intercepting it with netstack, it's not even important that
+	// we have a real kernel-level listener. So just create a dummy listener on Android
+	// and let netstack intercept it.
+	if runtime.GOOS == "android" {
+		return newFakePeerAPIListener(ip), nil
+	}
+
 	ipStr := ip.String()
 
 	var lc net.ListenConfig
@@ -428,8 +437,15 @@ func (s *peerAPIServer) listen(ip netaddr.IP, ifState *interfaces.State) (ln net
 			return ln, nil
 		}
 	}
-	// Fall back to random ephemeral port.
-	return lc.Listen(context.Background(), tcp4or6, net.JoinHostPort(ipStr, "0"))
+	// Fall back to some random ephemeral port.
+	ln, err = lc.Listen(context.Background(), tcp4or6, net.JoinHostPort(ipStr, "0"))
+
+	// And if we're on a platform with netstack (anything but iOS), then just fallback to netstack.
+	if err != nil && runtime.GOOS != "ios" {
+		s.b.logf("peerapi: failed to do peerAPI listen, harmless (netstack available) but error was: %v", err)
+		return newFakePeerAPIListener(ip), nil
+	}
+	return ln, err
 }
 
 type peerAPIListener struct {
@@ -548,6 +564,12 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v0/dnsfwd":
 		h.handleServeDNSFwd(w, r)
 		return
+	case "/v0/wol":
+		h.handleWakeOnLAN(w, r)
+		return
+	case "/v0/interfaces":
+		h.handleServeInterfaces(w, r)
+		return
 	}
 	who := h.peerUser.DisplayName
 	fmt.Fprintf(w, `<html>
@@ -560,6 +582,40 @@ This is my Tailscale device. Your device is %v.
 	if h.isSelf {
 		fmt.Fprintf(w, "<p>You are the owner of this node.\n")
 	}
+}
+
+func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Request) {
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
+		return
+	}
+	i, err := interfaces.GetList()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+	}
+
+	dr, err := interfaces.DefaultRoute()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintln(w, "<h1>Interfaces</h1>")
+	fmt.Fprintf(w, "<h3>Default route is %q(%d)</h3>\n", dr.InterfaceName, dr.InterfaceIndex)
+
+	fmt.Fprintln(w, "<table>")
+	fmt.Fprint(w, "<tr>")
+	for _, v := range []any{"Index", "Name", "MTU", "Flags", "Addrs"} {
+		fmt.Fprintf(w, "<th>%v</th> ", v)
+	}
+	fmt.Fprint(w, "</tr>\n")
+	i.ForeachInterface(func(iface interfaces.Interface, ipps []netaddr.IPPrefix) {
+		fmt.Fprint(w, "<tr>")
+		for _, v := range []any{iface.Index, iface.Name, iface.MTU, iface.Flags, ipps} {
+			fmt.Fprintf(w, "<td>%v</td> ", v)
+		}
+		fmt.Fprint(w, "</tr>\n")
+	})
+	fmt.Fprintln(w, "</table>")
 }
 
 type incomingFile struct {
@@ -620,9 +676,34 @@ func (f *incomingFile) PartialFile() ipn.PartialFile {
 	}
 }
 
+// canPutFile reports whether h can put a file ("Taildrop") to this node.
+func (h *peerAPIHandler) canPutFile() bool {
+	return h.isSelf || h.peerHasCap(tailcfg.CapabilityFileSharingSend)
+}
+
+// canDebug reports whether h can debug this node (goroutines, metrics,
+// magicsock internal state, etc).
+func (h *peerAPIHandler) canDebug() bool {
+	return h.isSelf || h.peerHasCap(tailcfg.CapabilityDebugPeer)
+}
+
+// canWakeOnLAN reports whether h can send a Wake-on-LAN packet from this node.
+func (h *peerAPIHandler) canWakeOnLAN() bool {
+	return h.isSelf || h.peerHasCap(tailcfg.CapabilityWakeOnLAN)
+}
+
+func (h *peerAPIHandler) peerHasCap(wantCap string) bool {
+	for _, hasCap := range h.ps.b.PeerCaps(h.remoteAddr.IP()) {
+		if hasCap == wantCap {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canPutFile() {
+		http.Error(w, "Taildrop access denied", http.StatusForbidden)
 		return
 	}
 	if !h.ps.b.hasCapFileSharing() {
@@ -741,8 +822,8 @@ func approxSize(n int64) string {
 }
 
 func (h *peerAPIHandler) handleServeGoroutines(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
 	var buf []byte
@@ -757,8 +838,8 @@ func (h *peerAPIHandler) handleServeGoroutines(w http.ResponseWriter, r *http.Re
 }
 
 func (h *peerAPIHandler) handleServeEnv(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
 	var data struct {
@@ -777,13 +858,13 @@ func (h *peerAPIHandler) handleServeEnv(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *peerAPIHandler) handleServeMagicsock(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
 	eng := h.ps.b.e
 	if ig, ok := eng.(wgengine.InternalsGetter); ok {
-		if _, mc, ok := ig.GetInternals(); ok {
+		if _, mc, _, ok := ig.GetInternals(); ok {
 			mc.ServeHTTPDebug(w, r)
 			return
 		}
@@ -792,8 +873,8 @@ func (h *peerAPIHandler) handleServeMagicsock(w http.ResponseWriter, r *http.Req
 }
 
 func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
@@ -801,8 +882,8 @@ func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Request) {
-	if !h.isSelf {
-		http.Error(w, "not owner", http.StatusForbidden)
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
 	dh := health.DebugHandler("dnsfwd")
@@ -811,6 +892,62 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	dh.ServeHTTP(w, r)
+}
+
+func (h *peerAPIHandler) handleWakeOnLAN(w http.ResponseWriter, r *http.Request) {
+	if !h.canWakeOnLAN() {
+		http.Error(w, "no WoL access", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "bad method", http.StatusMethodNotAllowed)
+		return
+	}
+	macStr := r.FormValue("mac")
+	if macStr == "" {
+		http.Error(w, "missing 'mac' param", http.StatusBadRequest)
+		return
+	}
+	mac, err := net.ParseMAC(macStr)
+	if err != nil {
+		http.Error(w, "bad 'mac' param", http.StatusBadRequest)
+		return
+	}
+	var password []byte // TODO(bradfitz): support?
+	st, err := interfaces.GetState()
+	if err != nil {
+		http.Error(w, "failed to get interfaces state", http.StatusInternalServerError)
+		return
+	}
+	var res struct {
+		SentTo []string
+		Errors []string
+	}
+	for ifName, ips := range st.InterfaceIPs {
+		for _, ip := range ips {
+			if ip.IP().IsLoopback() || ip.IP().Is6() {
+				continue
+			}
+			ipa := ip.IP().IPAddr()
+			local := &net.UDPAddr{
+				IP:   ipa.IP,
+				Port: 0,
+			}
+			remote := &net.UDPAddr{
+				IP:   net.IPv4bcast,
+				Port: 0,
+			}
+			if err := wol.Wake(mac, password, local, remote); err != nil {
+				res.Errors = append(res.Errors, err.Error())
+			} else {
+				res.SentTo = append(res.SentTo, ifName)
+			}
+			break // one per interface is enough
+		}
+	}
+	sort.Strings(res.SentTo)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
 
 func (h *peerAPIHandler) replyToDNSQueries() bool {
@@ -1027,3 +1164,49 @@ func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
 	w.Write(j)
 	return nil
 }
+
+// newFakePeerAPIListener creates a new net.Listener that acts like
+// it's listening on the provided IP address and on TCP port 1.
+//
+// See docs on fakePeerAPIListener.
+func newFakePeerAPIListener(ip netaddr.IP) net.Listener {
+	return &fakePeerAPIListener{
+		addr:   netaddr.IPPortFrom(ip, 1).TCPAddr(),
+		closed: make(chan struct{}),
+	}
+}
+
+// fakePeerAPIListener is a net.Listener that has an Addr method returning a TCPAddr
+// for a given IP on port 1 (arbitrary) and can be Closed, but otherwise Accept
+// just blocks forever until closed. The purpose of this is to let the rest
+// of the LocalBackend/PeerAPI code run and think it's talking to the kernel,
+// even if the kernel isn't cooperating (like on Android: Issue 4449, 4293, etc)
+// or we lack permission to listen on a port. It's okay to not actually listen via
+// the kernel because on almost all platforms (except iOS as of 2022-04-20) we
+// also intercept netstack TCP requests in to our peerapi port and hand it over
+// directly to peerapi, without involving the kernel. So this doesn't need to be
+// real. But the port number we return (1, in this case) is the port number we advertise
+// to peers and they connect to. 1 seems pretty safe to use. Even if the kernel's
+// using it, it doesn't matter, as we intercept it first in netstack and the kernel
+// never notices.
+//
+// Eventually we'll remove this code and do this on all platforms, when iOS also uses
+// netstack.
+type fakePeerAPIListener struct {
+	addr net.Addr
+
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (fl *fakePeerAPIListener) Close() error {
+	fl.closeOnce.Do(func() { close(fl.closed) })
+	return nil
+}
+
+func (fl *fakePeerAPIListener) Accept() (net.Conn, error) {
+	<-fl.closed
+	return nil, net.ErrClosed
+}
+
+func (fl *fakePeerAPIListener) Addr() net.Addr { return fl.addr }

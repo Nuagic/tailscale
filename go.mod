@@ -5,7 +5,6 @@ go 1.18
 require (
 	filippo.io/mkcert v1.4.3
 	github.com/akutz/memconn v0.1.0
-	github.com/alessio/shellescape v1.4.1
 	github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be
 	github.com/aws/aws-sdk-go-v2 v1.11.2
@@ -14,13 +13,14 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.21.0
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.17.1
 	github.com/coreos/go-iptables v0.6.0
+	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/creack/pty v1.1.17
 	github.com/dave/jennifer v1.4.1
 	github.com/frankban/quicktest v1.14.0
 	github.com/go-ole/go-ole v1.2.6
 	github.com/godbus/dbus/v5 v5.0.6
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da
-	github.com/google/go-cmp v0.5.7
+	github.com/google/go-cmp v0.5.8
 	github.com/google/uuid v1.3.0
 	github.com/goreleaser/nfpm v1.10.3
 	github.com/iancoleman/strcase v0.2.0
@@ -28,6 +28,7 @@ require (
 	github.com/jsimonetti/rtnetlink v1.1.2-0.20220408201609-d380b505068b
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/klauspost/compress v1.13.6
+	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a
 	github.com/mdlayher/genetlink v1.2.0
 	github.com/mdlayher/netlink v1.6.0
 	github.com/mdlayher/sdnotify v1.0.0
@@ -39,22 +40,22 @@ require (
 	github.com/tailscale/certstore v0.1.1-0.20220316223106-78d6e1c49d8d
 	github.com/tailscale/depaware v0.0.0-20210622194025-720c4b409502
 	github.com/tailscale/goexpect v0.0.0-20210902213824-6e8c725cea41
-	github.com/tailscale/golang-x-crypto v0.0.0-20220330002111-62119522bbcf
+	github.com/tailscale/golang-x-crypto v0.0.0-20220428210705-0b941c09a5e1
 	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05
-	github.com/tailscale/hujson v0.0.0-20211105212140-3a0adc019d83
+	github.com/tailscale/hujson v0.0.0-20220506202205-92b4b88a9e17
 	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/tcnksm/go-httpstat v0.2.0
 	github.com/toqueteos/webbrowser v1.2.0
 	github.com/u-root/u-root v0.8.0
 	github.com/vishvananda/netlink v1.1.1-0.20211118161826-650dca95af54
 	go4.org/mem v0.0.0-20210711025021-927187094b94
-	golang.org/x/crypto v0.0.0-20220321153916-2c7772ba3064
+	golang.org/x/crypto v0.0.0-20220427172511-eb4f295cb31f
 	golang.org/x/net v0.0.0-20220407224826-aac1ed45d8e3
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220408201424-a24fb2fb8a0f
+	golang.org/x/sys v0.0.0-20220503163025-988cb79eb6c6
 	golang.org/x/term v0.0.0-20210927222741-03fcf44c2211
 	golang.org/x/time v0.0.0-20211116232009-f0f3c7e86c11
-	golang.org/x/tools v0.1.11-0.20220316014157-77aa08bb151a
+	golang.org/x/tools v0.1.11-0.20220413170336-afc6aad76eb1
 	golang.zx2c4.com/wireguard v0.0.0-20220317000134-95b48cdb3961
 	golang.zx2c4.com/wireguard/windows v0.4.10
 	gvisor.dev/gvisor v0.0.0-20220407223209-21871174d445
@@ -251,7 +252,7 @@ require (
 	golang.org/x/exp/typeparams v0.0.0-20220328175248-053ad81199eb // indirect
 	golang.org/x/mod v0.6.0-dev.0.20220106191415-9b9b3d81d5e3 // indirect
 	golang.org/x/text v0.3.7 // indirect
-	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
+	golang.org/x/xerrors v0.0.0-20220411194840-2f41105eb62f // indirect
 	golang.zx2c4.com/wintun v0.0.0-20211104114900-415007cec224 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
 	gopkg.in/ini.v1 v1.66.2 // indirect

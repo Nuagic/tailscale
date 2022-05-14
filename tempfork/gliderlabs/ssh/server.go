@@ -38,8 +38,6 @@ type Server struct {
 	HostSigners []Signer // private keys for the host key, must have at least one
 	Version     string   // server version to be sent before the initial handshake
 
-	NoClientAuthCallback func(gossh.ConnMetadata) (*gossh.Permissions, error)
-
 	KeyboardInteractiveHandler    KeyboardInteractiveHandler    // keyboard-interactive authentication handler
 	PasswordHandler               PasswordHandler               // password authentication handler
 	PublicKeyHandler              PublicKeyHandler              // public key authentication handler
@@ -131,10 +129,6 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	if srv.PasswordHandler == nil && srv.PublicKeyHandler == nil && srv.KeyboardInteractiveHandler == nil {
 		config.NoClientAuth = true
 	}
-	if srv.NoClientAuthCallback != nil {
-		config.NoClientAuth = true
-		config.NoClientAuthCallback = srv.NoClientAuthCallback
-	}
 	if srv.Version != "" {
 		config.ServerVersion = "SSH-2.0-" + srv.Version
 	}
@@ -150,8 +144,8 @@ func (srv *Server) config(ctx Context) *gossh.ServerConfig {
 	if srv.PublicKeyHandler != nil {
 		config.PublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 			applyConnMetadata(ctx, conn)
-			if ok := srv.PublicKeyHandler(ctx, key); !ok {
-				return ctx.Permissions().Permissions, fmt.Errorf("permission denied")
+			if err := srv.PublicKeyHandler(ctx, key); err != nil {
+				return ctx.Permissions().Permissions, err
 			}
 			ctx.SetValue(ContextKeyPublicKey, key)
 			return ctx.Permissions().Permissions, nil

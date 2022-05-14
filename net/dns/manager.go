@@ -6,19 +6,53 @@ package dns
 
 import (
 	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"inet.af/netaddr"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
+	"tailscale.com/net/packet"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/net/tstun"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/monitor"
 )
+
+var (
+	magicDNSIP   = tsaddr.TailscaleServiceIP()
+	magicDNSIPv6 = tsaddr.TailscaleServiceIPv6()
+)
+
+var (
+	errFullQueue = errors.New("request queue full")
+)
+
+// maxActiveQueries returns the maximal number of DNS requests that be
+// can running.
+// If EnqueueRequest is called when this many requests are already pending,
+// the request will be dropped to avoid blocking the caller.
+func maxActiveQueries() int32 {
+	if runtime.GOOS == "ios" {
+		// For memory paranoia reasons on iOS, match the
+		// historical Tailscale 1.x..1.8 behavior for now
+		// (just before the 1.10 release).
+		return 64
+	}
+	// But for other platforms, allow more burstiness:
+	return 256
+}
 
 // We use file-ignore below instead of ignore because on some platforms,
 // the lint exception is necessary and on others it is not,
@@ -31,9 +65,26 @@ import (
 // Such operations should be wrapped in a timeout context.
 const reconfigTimeout = time.Second
 
+type response struct {
+	pkt []byte
+	to  netaddr.IPPort // response destination (request source)
+}
+
 // Manager manages system DNS settings.
 type Manager struct {
 	logf logger.Logf
+
+	// When netstack is not used, Manager implements magic DNS.
+	// In this case, responses tracks completed DNS requests
+	// which need a response, and NextPacket() synthesizes a
+	// fake IP+UDP header to finish assembling the response.
+	//
+	// TODO(tom): Rip out once all platforms use netstack.
+	responses           chan response
+	activeQueriesAtomic int32
+
+	ctx       context.Context    // good until Down
+	ctxCancel context.CancelFunc // closes ctx
 
 	resolver *resolver.Resolver
 	os       OSConfigurator
@@ -46,10 +97,12 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, linkMon *monitor.Mon, di
 	}
 	logf = logger.WithPrefix(logf, "dns: ")
 	m := &Manager{
-		logf:     logf,
-		resolver: resolver.New(logf, linkMon, linkSel, dialer),
-		os:       oscfg,
+		logf:      logf,
+		resolver:  resolver.New(logf, linkMon, linkSel, dialer),
+		os:        oscfg,
+		responses: make(chan response),
 	}
+	m.ctx, m.ctxCancel = context.WithCancel(context.Background())
 	m.logf("using %T", m.os)
 	return m
 }
@@ -91,7 +144,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// authoritative suffixes, even if we don't propagate MagicDNS to
 	// the OS.
 	rcfg.Hosts = cfg.Hosts
-	routes := map[dnsname.FQDN][]dnstype.Resolver{} // assigned conditionally to rcfg.Routes below.
+	routes := map[dnsname.FQDN][]*dnstype.Resolver{} // assigned conditionally to rcfg.Routes below.
 	for suffix, resolvers := range cfg.Routes {
 		if len(resolvers) == 0 {
 			rcfg.LocalDomains = append(rcfg.LocalDomains, suffix)
@@ -172,9 +225,9 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 			health.SetDNSOSHealth(err)
 			return resolver.Config{}, OSConfig{}, err
 		}
-		var defaultRoutes []dnstype.Resolver
+		var defaultRoutes []*dnstype.Resolver
 		for _, ip := range bcfg.Nameservers {
-			defaultRoutes = append(defaultRoutes, dnstype.ResolverFromIP(ip))
+			defaultRoutes = append(defaultRoutes, &dnstype.Resolver{Addr: ip.String()})
 		}
 		rcfg.Routes["."] = defaultRoutes
 		ocfg.SearchDomains = append(ocfg.SearchDomains, bcfg.SearchDomains...)
@@ -186,34 +239,234 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 // toIPsOnly returns only the IP portion of dnstype.Resolver.
 // Only safe to use if the resolvers slice has been cleared of
 // DoH or custom-port entries with something like hasDefaultIPResolversOnly.
-func toIPsOnly(resolvers []dnstype.Resolver) (ret []netaddr.IP) {
+func toIPsOnly(resolvers []*dnstype.Resolver) (ret []netaddr.IP) {
 	for _, r := range resolvers {
-		if ipp, err := netaddr.ParseIPPort(r.Addr); err == nil && ipp.Port() == 53 {
+		if ipp, ok := r.IPPort(); ok && ipp.Port() == 53 {
 			ret = append(ret, ipp.IP())
-		} else if ip, err := netaddr.ParseIP(r.Addr); err == nil {
-			ret = append(ret, ip)
 		}
 	}
 	return ret
 }
 
-func toIPPorts(ips []netaddr.IP) (ret []netaddr.IPPort) {
-	ret = make([]netaddr.IPPort, 0, len(ips))
-	for _, ip := range ips {
-		ret = append(ret, netaddr.IPPortFrom(ip, 53))
-	}
-	return ret
-}
-
+// EnqueuePacket is the legacy path for handling magic DNS traffic, and is
+// called with a DNS request payload.
+//
+// TODO(tom): Rip out once all platforms use netstack.
 func (m *Manager) EnqueuePacket(bs []byte, proto ipproto.Proto, from, to netaddr.IPPort) error {
-	return m.resolver.EnqueuePacket(bs, proto, from, to)
+	if to.Port() != 53 || proto != ipproto.UDP {
+		return nil
+	}
+
+	if n := atomic.AddInt32(&m.activeQueriesAtomic, 1); n > maxActiveQueries() {
+		atomic.AddInt32(&m.activeQueriesAtomic, -1)
+		metricDNSQueryErrorQueue.Add(1)
+		return errFullQueue
+	}
+
+	go func() {
+		resp, err := m.resolver.Query(m.ctx, bs, from)
+		if err != nil {
+			atomic.AddInt32(&m.activeQueriesAtomic, -1)
+			m.logf("dns query: %v", err)
+			return
+		}
+
+		select {
+		case <-m.ctx.Done():
+			return
+		case m.responses <- response{resp, from}:
+		}
+	}()
+	return nil
 }
 
+// NextPacket is the legacy path for obtaining DNS results in response to
+// magic DNS queries. It blocks until a response is available.
+//
+// TODO(tom): Rip out once all platforms use netstack.
 func (m *Manager) NextPacket() ([]byte, error) {
-	return m.resolver.NextPacket()
+	var resp response
+	select {
+	case <-m.ctx.Done():
+		return nil, net.ErrClosed
+	case resp = <-m.responses:
+		// continue
+	}
+
+	// Unused space is needed further down the stack. To avoid extra
+	// allocations/copying later on, we allocate such space here.
+	const offset = tstun.PacketStartOffset
+
+	var buf []byte
+	switch {
+	case resp.to.IP().Is4():
+		h := packet.UDP4Header{
+			IP4Header: packet.IP4Header{
+				Src: magicDNSIP,
+				Dst: resp.to.IP(),
+			},
+			SrcPort: 53,
+			DstPort: resp.to.Port(),
+		}
+		hlen := h.Len()
+		buf = make([]byte, offset+hlen+len(resp.pkt))
+		copy(buf[offset+hlen:], resp.pkt)
+		h.Marshal(buf[offset:])
+	case resp.to.IP().Is6():
+		h := packet.UDP6Header{
+			IP6Header: packet.IP6Header{
+				Src: magicDNSIPv6,
+				Dst: resp.to.IP(),
+			},
+			SrcPort: 53,
+			DstPort: resp.to.Port(),
+		}
+		hlen := h.Len()
+		buf = make([]byte, offset+hlen+len(resp.pkt))
+		copy(buf[offset+hlen:], resp.pkt)
+		h.Marshal(buf[offset:])
+	}
+
+	atomic.AddInt32(&m.activeQueriesAtomic, -1)
+	return buf, nil
+}
+
+func (m *Manager) Query(ctx context.Context, bs []byte, from netaddr.IPPort) ([]byte, error) {
+	select {
+	case <-m.ctx.Done():
+		return nil, net.ErrClosed
+	default:
+		// continue
+	}
+
+	if n := atomic.AddInt32(&m.activeQueriesAtomic, 1); n > maxActiveQueries() {
+		atomic.AddInt32(&m.activeQueriesAtomic, -1)
+		metricDNSQueryErrorQueue.Add(1)
+		return nil, errFullQueue
+	}
+	defer atomic.AddInt32(&m.activeQueriesAtomic, -1)
+	return m.resolver.Query(ctx, bs, from)
+}
+
+const (
+	// RFC 7766 6.2 recommends connection reuse & request pipelining
+	// be undertaken, and the connection be closed by the server
+	// using an idle timeout on the order of seconds.
+	idleTimeoutTCP = 45 * time.Second
+	// The RFCs don't specify the max size of a TCP-based DNS query,
+	// but we want to keep this reasonable. Given payloads are typically
+	// much larger and all known client send a single query, I've arbitrarily
+	// chosen 2k.
+	maxReqSizeTCP = 2048
+)
+
+// dnsTCPSession services DNS requests sent over TCP.
+type dnsTCPSession struct {
+	m *Manager
+
+	conn    net.Conn
+	srcAddr netaddr.IPPort
+
+	readClosing  chan struct{}
+	responses    chan []byte // DNS replies pending writing
+
+	ctx      context.Context
+	closeCtx context.CancelFunc
+}
+
+func (s *dnsTCPSession) handleWrites() {
+	defer s.conn.Close()
+	defer close(s.responses)
+	defer s.closeCtx()
+
+	for {
+		select {
+		case <-s.readClosing:
+			return // connection closed or timeout, teardown time
+
+		case resp := <-s.responses:
+			s.conn.SetWriteDeadline(time.Now().Add(idleTimeoutTCP))
+			if err := binary.Write(s.conn, binary.BigEndian, uint16(len(resp))); err != nil {
+				s.m.logf("tcp write (len): %v", err)
+				return
+			}
+			if _, err := s.conn.Write(resp); err != nil {
+				s.m.logf("tcp write (response): %v", err)
+				return
+			}
+		}
+	}
+}
+
+func (s *dnsTCPSession) handleQuery(q []byte) {
+	resp, err := s.m.Query(s.ctx, q, s.srcAddr)
+	if err != nil {
+		s.m.logf("tcp query: %v", err)
+		return
+	}
+
+	select {
+	case <-s.ctx.Done():
+	case s.responses <- resp:
+	}
+}
+
+func (s *dnsTCPSession) handleReads() {
+	defer close(s.readClosing)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+
+		default:
+			s.conn.SetReadDeadline(time.Now().Add(idleTimeoutTCP))
+			var reqLen uint16
+			if err := binary.Read(s.conn, binary.BigEndian, &reqLen); err != nil {
+				if err == io.EOF || err == io.ErrClosedPipe {
+					return // connection closed nominally, we gucci
+				}
+				s.m.logf("tcp read (len): %v", err)
+				return
+			}
+			if int(reqLen) > maxReqSizeTCP {
+				s.m.logf("tcp request too large (%d > %d)", reqLen, maxReqSizeTCP)
+				return
+			}
+
+			buf := make([]byte, int(reqLen))
+			if _, err := io.ReadFull(s.conn, buf); err != nil {
+				s.m.logf("tcp read (payload): %v", err)
+				return
+			}
+
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				go s.handleQuery(buf)
+			}
+		}
+	}
+}
+
+// HandleTCPConn implements magicDNS over TCP, taking a connection and
+// servicing DNS requests sent down it.
+func (m *Manager) HandleTCPConn(conn net.Conn, srcAddr netaddr.IPPort) {
+	s := dnsTCPSession{
+		m:            m,
+		conn:         conn,
+		srcAddr:      srcAddr,
+		responses:    make(chan []byte),
+		readClosing:  make(chan struct{}),
+	}
+	s.ctx, s.closeCtx = context.WithCancel(context.Background())
+	go s.handleReads()
+	s.handleWrites()
 }
 
 func (m *Manager) Down() error {
+	m.ctxCancel()
 	if err := m.os.Close(); err != nil {
 		return err
 	}
@@ -239,3 +492,7 @@ func Cleanup(logf logger.Logf, interfaceName string) {
 		logf("dns down: %v", err)
 	}
 }
+
+var (
+	metricDNSQueryErrorQueue = clientmetric.NewCounter("dns_query_local_error_queue")
+)

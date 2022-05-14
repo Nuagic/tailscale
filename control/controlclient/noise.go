@@ -18,8 +18,10 @@ import (
 	"golang.org/x/net/http2"
 	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
 )
 
@@ -45,6 +47,7 @@ func (c *noiseConn) Close() error {
 // the ts2021 protocol.
 type noiseClient struct {
 	*http.Client // HTTP client used to talk to tailcontrol
+	dialer       *tsdial.Dialer
 	privKey      key.MachinePrivate
 	serverPubKey key.MachinePublic
 	serverHost   string // the host:port part of serverURL
@@ -57,7 +60,7 @@ type noiseClient struct {
 
 // newNoiseClient returns a new noiseClient for the provided server and machine key.
 // serverURL is of the form https://<host>:<port> (no trailing slash).
-func newNoiseClient(priKey key.MachinePrivate, serverPubKey key.MachinePublic, serverURL string) (*noiseClient, error) {
+func newNoiseClient(priKey key.MachinePrivate, serverPubKey key.MachinePublic, serverURL string, dialer *tsdial.Dialer) (*noiseClient, error) {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return nil, err
@@ -74,6 +77,7 @@ func newNoiseClient(priKey key.MachinePrivate, serverPubKey key.MachinePublic, s
 		serverPubKey: serverPubKey,
 		privKey:      priKey,
 		serverHost:   host,
+		dialer:       dialer,
 	}
 
 	// Create the HTTP/2 Transport using a net/http.Transport
@@ -137,9 +141,6 @@ func (nc *noiseClient) Close() error {
 func (nc *noiseClient) dial(_, _ string, _ *tls.Config) (net.Conn, error) {
 	nc.mu.Lock()
 	connID := nc.nextID
-	if nc.connPool == nil {
-		nc.connPool = make(map[int]*noiseConn)
-	}
 	nc.nextID++
 	nc.mu.Unlock()
 
@@ -153,7 +154,7 @@ func (nc *noiseClient) dial(_, _ string, _ *tls.Config) (net.Conn, error) {
 		// thousand version numbers before getting to this point.
 		panic("capability version is too high to fit in the wire protocol")
 	}
-	conn, err := controlhttp.Dial(ctx, nc.serverHost, nc.privKey, nc.serverPubKey, uint16(tailcfg.CurrentCapabilityVersion))
+	conn, err := controlhttp.Dial(ctx, nc.serverHost, nc.privKey, nc.serverPubKey, uint16(tailcfg.CurrentCapabilityVersion), nc.dialer.SystemDial)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +162,6 @@ func (nc *noiseClient) dial(_, _ string, _ *tls.Config) (net.Conn, error) {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	ncc := &noiseConn{Conn: conn, id: connID, pool: nc}
-	nc.connPool[ncc.id] = ncc
+	mak.Set(&nc.connPool, ncc.id, ncc)
 	return ncc, nil
 }

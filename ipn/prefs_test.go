@@ -302,7 +302,7 @@ func checkPrefs(t *testing.T, p Prefs) {
 	if p.Equals(p2) {
 		t.Fatalf("p == p2\n")
 	}
-	p2b, err = PrefsFromBytes(p2.ToBytes(), false)
+	p2b, err = PrefsFromBytes(p2.ToBytes())
 	if err != nil {
 		t.Fatalf("PrefsFromBytes(p2) failed\n")
 	}
@@ -808,5 +808,20 @@ func TestExitNodeIPOfArg(t *testing.T) {
 				t.Fatalf("got %v; want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestControlURLOrDefault(t *testing.T) {
+	var p Prefs
+	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+	p.ControlURL = "http://foo.bar"
+	if got, want := p.ControlURLOrDefault(), "http://foo.bar"; got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+	p.ControlURL = "https://login.tailscale.com"
+	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
+		t.Errorf("got %q; want %q", got, want)
 	}
 }

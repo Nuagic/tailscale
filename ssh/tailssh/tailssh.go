@@ -9,8 +9,10 @@
 package tailssh
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,52 +37,217 @@ import (
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/mak"
 )
 
-// TODO(bradfitz): this is all very temporary as code is temporarily
-// being moved around; it will be restructured and documented in
-// following commits.
+var (
+	debugPolicyFile             = envknob.SSHPolicyFile()
+	debugIgnoreTailnetSSHPolicy = envknob.SSHIgnoreTailnetPolicy()
+	sshVerboseLogging           = envknob.Bool("TS_DEBUG_SSH_VLOG")
+)
 
-// Handle handles an SSH connection from c.
-func Handle(logf logger.Logf, lb *ipnlocal.LocalBackend, c net.Conn) error {
-	tsd, err := os.Executable()
-	if err != nil {
-		return err
+type server struct {
+	lb             *ipnlocal.LocalBackend
+	logf           logger.Logf
+	tailscaledPath string
+
+	pubKeyHTTPClient *http.Client     // or nil for http.DefaultClient
+	timeNow          func() time.Time // or nil for time.Now
+
+	// mu protects the following
+	mu                      sync.Mutex
+	activeSessionByH        map[string]*sshSession      // ssh.SessionID (DH H) => session
+	activeSessionBySharedID map[string]*sshSession      // yyymmddThhmmss-XXXXX => session
+	fetchPublicKeysCache    map[string]pubKeyCacheEntry // by https URL
+}
+
+func (srv *server) now() time.Time {
+	if srv.timeNow != nil {
+		return srv.timeNow()
 	}
-	srv := &server{
-		lb:             lb,
-		logf:           logf,
-		tailscaledPath: tsd,
-	}
-	ss, err := srv.newSSHServer()
+	return time.Now()
+}
+
+func init() {
+	ipnlocal.RegisterNewSSHServer(func(logf logger.Logf, lb *ipnlocal.LocalBackend) (ipnlocal.SSHServer, error) {
+		tsd, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		srv := &server{
+			lb:             lb,
+			logf:           logf,
+			tailscaledPath: tsd,
+		}
+		return srv, nil
+	})
+}
+
+// HandleSSHConn handles a Tailscale SSH connection from c.
+func (srv *server) HandleSSHConn(c net.Conn) error {
+	ss, err := srv.newConn()
 	if err != nil {
 		return err
 	}
 	ss.HandleConn(c)
+
+	// Return nil to signal to netstack's interception that it doesn't need to
+	// log. If ss.HandleConn had problems, it can log itself (ideally on an
+	// sshSession.logf).
 	return nil
 }
 
-func (srv *server) newSSHServer() (*ssh.Server, error) {
-	ss := &ssh.Server{
-		Handler:           srv.handleSSH,
-		RequestHandlers:   map[string]ssh.RequestHandler{},
-		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
+// OnPolicyChange terminates any active sessions that no longer match
+// the SSH access policy.
+func (srv *server) OnPolicyChange() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for _, s := range srv.activeSessionByH {
+		go s.checkStillValid()
+	}
+}
+
+// conn represents a single SSH connection and its associated
+// ssh.Server.
+type conn struct {
+	*ssh.Server
+
+	// now is the time to consider the present moment for the
+	// purposes of rule evaluation.
+	now time.Time
+
+	action0      *tailcfg.SSHAction // first matching action
+	srv          *server
+	info         *sshConnInfo // set by setInfo
+	localUser    *user.User   // set by checkAuth
+	userGroupIDs []string     // set by checkAuth
+
+	insecureSkipTailscaleAuth bool // used by tests.
+}
+
+func (c *conn) logf(format string, args ...any) {
+	if c.info == nil {
+		c.srv.logf(format, args...)
+		return
+	}
+	format = fmt.Sprintf("%v: %v", c.info.String(), format)
+	c.srv.logf(format, args...)
+}
+
+// PublicKeyHandler implements ssh.PublicKeyHandler is called by the the
+// ssh.Server when the client presents a public key.
+func (c *conn) PublicKeyHandler(ctx ssh.Context, pubKey ssh.PublicKey) error {
+	if c.info == nil {
+		return gossh.ErrDenied
+	}
+	if err := c.checkAuth(pubKey); err != nil {
+		// TODO(maisem/bradfitz): surface the error here.
+		c.logf("rejecting SSH public key %s: %v", bytes.TrimSpace(gossh.MarshalAuthorizedKey(pubKey)), err)
+		return err
+	}
+	c.logf("accepting SSH public key %s", bytes.TrimSpace(gossh.MarshalAuthorizedKey(pubKey)))
+	return nil
+}
+
+// errPubKeyRequired is returned by NoClientAuthCallback to make the client
+// resort to public-key auth; not user visible.
+var errPubKeyRequired = errors.New("ssh publickey required")
+
+// NoClientAuthCallback implements gossh.NoClientAuthCallback and is called by
+// the the ssh.Server when the client first connects with the "none"
+// authentication method.
+func (c *conn) NoClientAuthCallback(cm gossh.ConnMetadata) (*gossh.Permissions, error) {
+	if c.insecureSkipTailscaleAuth {
+		return nil, nil
+	}
+	if err := c.setInfo(cm); err != nil {
+		c.logf("failed to get conninfo: %v", err)
+		return nil, gossh.ErrDenied
+	}
+	return nil, c.checkAuth(nil /* no pub key */)
+}
+
+// checkAuth verifies that conn can proceed with the specified (optional)
+// pubKey. It returns nil if the matching policy action is Accept or
+// HoldAndDelegate. If pubKey is nil, there was no policy match but there is a
+// policy that might match a public key it returns errPubKeyRequired. Otherwise,
+// it returns gossh.ErrDenied possibly wrapped in gossh.WithBannerError.
+func (c *conn) checkAuth(pubKey ssh.PublicKey) error {
+	a, localUser, err := c.evaluatePolicy(pubKey)
+	if err != nil {
+		if pubKey == nil && c.havePubKeyPolicy(c.info) {
+			return errPubKeyRequired
+		}
+		return fmt.Errorf("%w: %v", gossh.ErrDenied, err)
+	}
+	c.action0 = a
+	if a.Accept || a.HoldAndDelegate != "" {
+		lu, err := user.Lookup(localUser)
+		if err != nil {
+			c.logf("failed to lookup %v: %v", localUser, err)
+			return gossh.WithBannerError{
+				Err:     gossh.ErrDenied,
+				Message: fmt.Sprintf("failed to lookup %v\r\n", localUser),
+			}
+		}
+		gids, err := lu.GroupIds()
+		if err != nil {
+			return err
+		}
+		c.userGroupIDs = gids
+		c.localUser = lu
+		return nil
+	}
+	if a.Reject {
+		err := gossh.ErrDenied
+		if a.Message != "" {
+			err = gossh.WithBannerError{
+				Err:     err,
+				Message: a.Message,
+			}
+		}
+		return err
+	}
+	// Shouldn't get here, but:
+	return gossh.ErrDenied
+}
+
+// ServerConfig implements ssh.ServerConfigCallback.
+func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
+	return &gossh.ServerConfig{
+		// OpenSSH presents this on failure as `Permission denied (tailscale).`
+		ImplictAuthMethod:    "tailscale",
+		NoClientAuth:         true, // required for the NoClientAuthCallback to run
+		NoClientAuthCallback: c.NoClientAuthCallback,
+	}
+}
+
+func (srv *server) newConn() (*conn, error) {
+	c := &conn{srv: srv, now: srv.now()}
+	c.Server = &ssh.Server{
+		Version:         "Tailscale",
+		Handler:         c.handleConnPostSSHAuth,
+		RequestHandlers: map[string]ssh.RequestHandler{},
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+			"sftp": c.handleConnPostSSHAuth,
+		},
+
 		// Note: the direct-tcpip channel handler and LocalPortForwardingCallback
 		// only adds support for forwarding ports from the local machine.
 		// TODO(maisem/bradfitz): add remote port forwarding support.
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
-		Version:                     "SSH-2.0-Tailscale",
 		LocalPortForwardingCallback: srv.mayForwardLocalPortTo,
-		NoClientAuthCallback: func(m gossh.ConnMetadata) (*gossh.Permissions, error) {
-			srv.logf("SSH connection from %v for %q; client ver %q", m.RemoteAddr(), m.User(), m.ClientVersion())
-			return nil, nil
-		},
+
+		PublicKeyHandler:     c.PublicKeyHandler,
+		ServerConfigCallback: c.ServerConfig,
 	}
+	ss := c.Server
 	for k, v := range ssh.DefaultRequestHandlers {
 		ss.RequestHandlers[k] = v
 	}
@@ -97,21 +264,8 @@ func (srv *server) newSSHServer() (*ssh.Server, error) {
 	for _, signer := range keys {
 		ss.AddHostKey(signer)
 	}
-	return ss, nil
+	return c, nil
 }
-
-type server struct {
-	lb             *ipnlocal.LocalBackend
-	logf           logger.Logf
-	tailscaledPath string
-
-	// mu protects activeSessions.
-	mu                      sync.Mutex
-	activeSessionByH        map[string]*sshSession // ssh.SessionID (DH H) => that session
-	activeSessionBySharedID map[string]*sshSession // yyymmddThhmmss-XXXXX => session
-}
-
-var debugPolicyFile = envknob.String("TS_DEBUG_SSH_POLICY_FILE")
 
 // mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
@@ -124,27 +278,56 @@ func (srv *server) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string
 	return ss.action.AllowLocalPortForwarding
 }
 
+// havePubKeyPolicy reports whether any policy rule may provide access by means
+// of a ssh.PublicKey.
+func (c *conn) havePubKeyPolicy(ci *sshConnInfo) bool {
+	// Is there any rule that looks like it'd require a public key for this
+	// sshUser?
+	pol, ok := c.sshPolicy()
+	if !ok {
+		return false
+	}
+	for _, r := range pol.Rules {
+		if c.ruleExpired(r) {
+			continue
+		}
+		if mapLocalUser(r.SSHUsers, ci.sshUser) == "" {
+			continue
+		}
+		for _, p := range r.Principals {
+			if len(p.PubKeys) > 0 && c.principalMatchesTailscaleIdentity(p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // sshPolicy returns the SSHPolicy for current node.
 // If there is no SSHPolicy in the netmap, it returns a debugPolicy
 // if one is defined.
-func (srv *server) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
-	lb := srv.lb
+func (c *conn) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
+	lb := c.srv.lb
+	if !lb.ShouldRunSSH() {
+		return nil, false
+	}
 	nm := lb.NetMap()
 	if nm == nil {
 		return nil, false
 	}
-	if pol := nm.SSHPolicy; pol != nil {
+	if pol := nm.SSHPolicy; pol != nil && !debugIgnoreTailnetSSHPolicy {
 		return pol, true
 	}
 	if debugPolicyFile != "" {
+		c.logf("reading debug SSH policy file: %v", debugPolicyFile)
 		f, err := os.ReadFile(debugPolicyFile)
 		if err != nil {
-			srv.logf("error reading debug SSH policy file: %v", err)
+			c.logf("error reading debug SSH policy file: %v", err)
 			return nil, false
 		}
 		p := new(tailcfg.SSHPolicy)
 		if err := json.Unmarshal(f, p); err != nil {
-			srv.logf("invalid JSON in %v: %v", debugPolicyFile, err)
+			c.logf("invalid JSON in %v: %v", debugPolicyFile, err)
 			return nil, false
 		}
 		return p, true
@@ -152,106 +335,210 @@ func (srv *server) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
 	return nil, false
 }
 
-func asTailscaleIPPort(a net.Addr) (netaddr.IPPort, error) {
+func toIPPort(a net.Addr) (ipp netaddr.IPPort) {
 	ta, ok := a.(*net.TCPAddr)
 	if !ok {
-		return netaddr.IPPort{}, fmt.Errorf("non-TCP addr %T %v", a, a)
+		return
 	}
 	tanetaddr, ok := netaddr.FromStdIP(ta.IP)
 	if !ok {
-		return netaddr.IPPort{}, fmt.Errorf("unparseable addr %v", ta.IP)
+		return
 	}
-	if !tsaddr.IsTailscaleIP(tanetaddr) {
-		return netaddr.IPPort{}, fmt.Errorf("non-Tailscale addr %v", ta.IP)
-	}
-	return netaddr.IPPortFrom(tanetaddr, uint16(ta.Port)), nil
+	return netaddr.IPPortFrom(tanetaddr, uint16(ta.Port))
 }
 
-// evaluatePolicy returns the SSHAction, sshConnInfo and localUser
-// after evaluating the sshUser and remoteAddr against the SSHPolicy.
-// The remoteAddr and localAddr params must be Tailscale IPs.
-func (srv *server) evaluatePolicy(sshUser string, localAddr, remoteAddr net.Addr) (_ *tailcfg.SSHAction, _ *sshConnInfo, localUser string, _ error) {
-	logf := srv.logf
-	lb := srv.lb
-	logf("Handling SSH from %v for user %v", remoteAddr, sshUser)
-
-	pol, ok := srv.sshPolicy()
-	if !ok {
-		return nil, nil, "", fmt.Errorf("tsshd: rejecting connection; no SSH policy")
-	}
-
-	srcIPP, err := asTailscaleIPPort(remoteAddr)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("tsshd: rejecting: %w", err)
-	}
-	dstIPP, err := asTailscaleIPPort(localAddr)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	node, uprof, ok := lb.WhoIs(srcIPP)
-	if !ok {
-		return nil, nil, "", fmt.Errorf("Hello, %v. I don't know who you are.\n", srcIPP)
-	}
-
+// connInfo returns a populated sshConnInfo from the provided arguments,
+// validating only that they represent a known Tailscale identity.
+func (c *conn) setInfo(cm gossh.ConnMetadata) error {
 	ci := &sshConnInfo{
-		now:     time.Now(),
-		sshUser: sshUser,
-		src:     srcIPP,
-		dst:     dstIPP,
-		node:    node,
-		uprof:   &uprof,
+		sshUser: cm.User(),
+		src:     toIPPort(cm.RemoteAddr()),
+		dst:     toIPPort(cm.LocalAddr()),
 	}
-	a, localUser, ok := evalSSHPolicy(pol, ci)
+	if !tsaddr.IsTailscaleIP(ci.dst.IP()) {
+		return fmt.Errorf("tailssh: rejecting non-Tailscale local address %v", ci.dst)
+	}
+	if !tsaddr.IsTailscaleIP(ci.src.IP()) {
+		return fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", ci.src)
+	}
+	node, uprof, ok := c.srv.lb.WhoIs(ci.src)
 	if !ok {
-		return nil, nil, "", fmt.Errorf("ssh: access denied for %q from %v", uprof.LoginName, ci.src.IP())
+		return fmt.Errorf("unknown Tailscale identity from src %v", ci.src)
 	}
-	return a, ci, localUser, nil
+	ci.node = node
+	ci.uprof = &uprof
+
+	c.info = ci
+	return nil
 }
 
-// handleSSH is invoked when a new SSH connection attempt is made.
-func (srv *server) handleSSH(s ssh.Session) {
-	logf := srv.logf
+// evaluatePolicy returns the SSHAction and localUser after evaluating
+// the SSHPolicy for this conn. The pubKey may be nil for "none" auth.
+func (c *conn) evaluatePolicy(pubKey gossh.PublicKey) (_ *tailcfg.SSHAction, localUser string, _ error) {
+	pol, ok := c.sshPolicy()
+	if !ok {
+		return nil, "", fmt.Errorf("tailssh: rejecting connection; no SSH policy")
+	}
+	a, localUser, ok := c.evalSSHPolicy(pol, pubKey)
+	if !ok {
+		return nil, "", fmt.Errorf("tailssh: rejecting connection; no matching policy")
+	}
+	return a, localUser, nil
+}
 
+// pubKeyCacheEntry is the cache value for an HTTPS URL of public keys (like
+// "https://github.com/foo.keys")
+type pubKeyCacheEntry struct {
+	lines []string
+	etag  string // if sent by server
+	at    time.Time
+}
+
+const (
+	pubKeyCacheDuration      = time.Minute      // how long to cache non-empty public keys
+	pubKeyCacheEmptyDuration = 15 * time.Second // how long to cache empty responses
+)
+
+func (srv *server) fetchPublicKeysURLCached(url string) (ce pubKeyCacheEntry, ok bool) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	// Mostly don't care about the size of this cache. Clean rarely.
+	if m := srv.fetchPublicKeysCache; len(m) > 50 {
+		tooOld := srv.now().Add(pubKeyCacheDuration * 10)
+		for k, ce := range m {
+			if ce.at.Before(tooOld) {
+				delete(m, k)
+			}
+		}
+	}
+	ce, ok = srv.fetchPublicKeysCache[url]
+	if !ok {
+		return ce, false
+	}
+	maxAge := pubKeyCacheDuration
+	if len(ce.lines) == 0 {
+		maxAge = pubKeyCacheEmptyDuration
+	}
+	return ce, srv.now().Sub(ce.at) < maxAge
+}
+
+func (srv *server) pubKeyClient() *http.Client {
+	if srv.pubKeyHTTPClient != nil {
+		return srv.pubKeyHTTPClient
+	}
+	return http.DefaultClient
+}
+
+// fetchPublicKeysURL fetches the public keys from a URL. The strings are in the
+// the typical public key "type base64-string [comment]" format seen at e.g.
+// https://github.com/USER.keys
+func (srv *server) fetchPublicKeysURL(url string) ([]string, error) {
+	if !strings.HasPrefix(url, "https://") {
+		return nil, errors.New("invalid URL scheme")
+	}
+
+	ce, ok := srv.fetchPublicKeysURLCached(url)
+	if ok {
+		return ce.lines, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ce.etag != "" {
+		req.Header.Add("If-None-Match", ce.etag)
+	}
+	res, err := srv.pubKeyClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	var lines []string
+	var etag string
+	switch res.StatusCode {
+	default:
+		err = fmt.Errorf("unexpected status %v", res.Status)
+		srv.logf("fetching public keys from %s: %v", url, err)
+	case http.StatusNotModified:
+		lines = ce.lines
+		etag = ce.etag
+	case http.StatusOK:
+		var all []byte
+		all, err = io.ReadAll(io.LimitReader(res.Body, 4<<10))
+		if s := strings.TrimSpace(string(all)); s != "" {
+			lines = strings.Split(s, "\n")
+		}
+		etag = res.Header.Get("Etag")
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	mak.Set(&srv.fetchPublicKeysCache, url, pubKeyCacheEntry{
+		at:    srv.now(),
+		lines: lines,
+		etag:  etag,
+	})
+	return lines, err
+}
+
+// handleConnPostSSHAuth runs an SSH session after the SSH-level authentication,
+// but not necessarily before all the Tailscale-level extra verification has
+// completed. It also handles SFTP requests.
+func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
 	sshUser := s.User()
-	action, ci, localUser, err := srv.evaluatePolicy(sshUser, s.LocalAddr(), s.RemoteAddr())
+	cr := &contextReader{r: s}
+	action, err := c.resolveTerminalAction(s, cr)
 	if err != nil {
-		logf(err.Error())
-		s.Exit(1)
-		return
-	}
-
-	lu, err := user.Lookup(localUser)
-	if err != nil {
-		logf("ssh: user Lookup %q: %v", localUser, err)
-		s.Exit(1)
-		return
-	}
-
-	ss := srv.newSSHSession(s, ci, lu)
-	action, err = ss.resolveTerminalAction(action)
-	if err != nil {
-		logf("ssh: resolveTerminalAction: %v", err)
-		io.WriteString(s.Stderr(), "Access denied: failed to resolve SSHAction.\n")
+		c.logf("resolveTerminalAction: %v", err)
+		io.WriteString(s.Stderr(), "Access Denied: failed during authorization check.\r\n")
 		s.Exit(1)
 		return
 	}
 	if action.Reject || !action.Accept {
-		logf("ssh: access denied for %q from %v", ci.uprof.LoginName, ci.src.IP())
+		c.logf("access denied for %v", c.info.uprof.LoginName)
 		s.Exit(1)
 		return
 	}
 
-	ss.action = action
+	if cr.HasOutstandingRead() {
+		s = contextReaderSesssion{s, cr}
+	}
+
+	// Do this check after auth, but before starting the session.
+	switch s.Subsystem() {
+	case "sftp", "":
+	default:
+		fmt.Fprintf(s.Stderr(), "Unsupported subsystem %q \r\n", s.Subsystem())
+		s.Exit(1)
+		return
+	}
+
+	ss := c.newSSHSession(s, action)
+	ss.logf("handling new SSH connection from %v (%v) to ssh-user %q", c.info.uprof.LoginName, c.info.src.IP(), sshUser)
+	ss.logf("access granted to %v as ssh-user %q", c.info.uprof.LoginName, sshUser)
 	ss.run()
 }
 
-// resolveTerminalAction either returns action (if it's Accept or Reject) or else
-// loops, fetching new SSHActions from the control plane.
+// resolveTerminalAction either returns action0 (if it's Accept or Reject) or
+// else loops, fetching new SSHActions from the control plane.
 //
-// Any action with a Message in the chain will be printed to ss.
+// Any action with a Message in the chain will be printed to s.
 //
 // The returned SSHAction will be either Reject or Accept.
-func (ss *sshSession) resolveTerminalAction(action *tailcfg.SSHAction) (*tailcfg.SSHAction, error) {
+func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg.SSHAction, error) {
+	action := c.action0
+
+	var awaitReadOnce sync.Once // to start Reads on cr
+	var sawInterrupt syncs.AtomicBool
+	var wg sync.WaitGroup
+	defer wg.Wait() // wait for awaitIntrOnce's goroutine to exit
+
+	ctx, cancel := context.WithCancel(s.Context())
+	defer cancel()
+
 	// Loop processing/fetching Actions until one reaches a
 	// terminal state (Accept, Reject, or invalid Action), or
 	// until fetchSSHAction times out due to the context being
@@ -260,7 +547,7 @@ func (ss *sshSession) resolveTerminalAction(action *tailcfg.SSHAction) (*tailcfg
 	// instructions and go to a URL to do something.)
 	for {
 		if action.Message != "" {
-			io.WriteString(ss.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
+			io.WriteString(s.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
 		}
 		if action.Accept || action.Reject {
 			return action, nil
@@ -269,29 +556,68 @@ func (ss *sshSession) resolveTerminalAction(action *tailcfg.SSHAction) (*tailcfg
 		if url == "" {
 			return nil, errors.New("reached Action that lacked Accept, Reject, and HoldAndDelegate")
 		}
-		url = ss.expandDelegateURL(url)
+		awaitReadOnce.Do(func() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 1)
+				for {
+					n, err := cr.ReadContext(ctx, buf)
+					if err != nil {
+						return
+					}
+					if n > 0 && buf[0] == 0x03 { // Ctrl-C
+						sawInterrupt.Set(true)
+						s.Stderr().Write([]byte("Canceled.\r\n"))
+						s.Exit(1)
+						return
+					}
+				}
+			}()
+		})
+		url = c.expandDelegateURL(url)
 		var err error
-		action, err = ss.srv.fetchSSHAction(ss.Context(), url)
+		action, err = c.fetchSSHAction(ctx, url)
 		if err != nil {
+			if sawInterrupt.Get() {
+				return nil, fmt.Errorf("aborted by user")
+			}
 			return nil, fmt.Errorf("fetching SSHAction from %s: %w", url, err)
 		}
 	}
 }
 
-func (ss *sshSession) expandDelegateURL(actionURL string) string {
-	nm := ss.srv.lb.NetMap()
+func (c *conn) expandDelegateURL(actionURL string) string {
+	nm := c.srv.lb.NetMap()
+	ci := c.info
 	var dstNodeID string
 	if nm != nil {
 		dstNodeID = fmt.Sprint(int64(nm.SelfNode.ID))
 	}
 	return strings.NewReplacer(
-		"$SRC_NODE_IP", url.QueryEscape(ss.connInfo.src.IP().String()),
-		"$SRC_NODE_ID", fmt.Sprint(int64(ss.connInfo.node.ID)),
-		"$DST_NODE_IP", url.QueryEscape(ss.connInfo.dst.IP().String()),
+		"$SRC_NODE_IP", url.QueryEscape(ci.src.IP().String()),
+		"$SRC_NODE_ID", fmt.Sprint(int64(ci.node.ID)),
+		"$DST_NODE_IP", url.QueryEscape(ci.dst.IP().String()),
 		"$DST_NODE_ID", dstNodeID,
-		"$SSH_USER", url.QueryEscape(ss.connInfo.sshUser),
-		"$LOCAL_USER", url.QueryEscape(ss.localUser.Username),
+		"$SSH_USER", url.QueryEscape(ci.sshUser),
+		"$LOCAL_USER", url.QueryEscape(c.localUser.Username),
 	).Replace(actionURL)
+}
+
+func (c *conn) expandPublicKeyURL(pubKeyURL string) string {
+	if !strings.Contains(pubKeyURL, "$") {
+		return pubKeyURL
+	}
+	var localPart string
+	var loginName string
+	if c.info.uprof != nil {
+		loginName = c.info.uprof.LoginName
+		localPart, _, _ = strings.Cut(loginName, "@")
+	}
+	return strings.NewReplacer(
+		"$LOGINNAME_EMAIL", loginName,
+		"$LOGINNAME_LOCALPART", localPart,
+	).Replace(pubKeyURL)
 }
 
 // sshSession is an accepted Tailscale SSH session.
@@ -302,10 +628,8 @@ type sshSession struct {
 	logf     logger.Logf
 
 	ctx           *sshContext // implements context.Context
-	srv           *server
-	connInfo      *sshConnInfo
+	conn          *conn
 	action        *tailcfg.SSHAction
-	localUser     *user.User
 	agentListener net.Listener // non-nil if agent-forwarding requested+allowed
 
 	// initialized by launchProcess:
@@ -320,24 +644,54 @@ type sshSession struct {
 	exitOnce sync.Once
 }
 
-func (srv *server) newSSHSession(s ssh.Session, ci *sshConnInfo, lu *user.User) *sshSession {
-	sharedID := fmt.Sprintf("%s-%02x", ci.now.UTC().Format("20060102T150405"), randBytes(5))
-	return &sshSession{
-		Session:   s,
-		idH:       s.Context().(ssh.Context).SessionID(),
-		sharedID:  sharedID,
-		ctx:       newSSHContext(),
-		srv:       srv,
-		localUser: lu,
-		connInfo:  ci,
-		logf:      logger.WithPrefix(srv.logf, "ssh-session("+sharedID+"): "),
+func (ss *sshSession) vlogf(format string, args ...interface{}) {
+	if sshVerboseLogging {
+		ss.logf(format, args...)
 	}
 }
 
-func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHAction, error) {
+func (c *conn) newSSHSession(s ssh.Session, action *tailcfg.SSHAction) *sshSession {
+	sharedID := fmt.Sprintf("%s-%02x", c.now.UTC().Format("20060102T150405"), randBytes(5))
+	c.logf("starting session: %v", sharedID)
+	return &sshSession{
+		Session:  s,
+		idH:      s.Context().(ssh.Context).SessionID(),
+		sharedID: sharedID,
+		ctx:      newSSHContext(),
+		conn:     c,
+		logf:     logger.WithPrefix(c.srv.logf, "ssh-session("+sharedID+"): "),
+		action:   action,
+	}
+}
+
+func (c *conn) isStillValid(pubKey ssh.PublicKey) bool {
+	a, localUser, err := c.evaluatePolicy(pubKey)
+	if err != nil {
+		return false
+	}
+	if !a.Accept && a.HoldAndDelegate == "" {
+		return false
+	}
+	return c.localUser.Username == localUser
+}
+
+// checkStillValid checks that the session is still valid per the latest SSHPolicy.
+// If not, it terminates the session.
+func (ss *sshSession) checkStillValid() {
+	if ss.conn.isStillValid(ss.PublicKey()) {
+		return
+	}
+	ss.logf("session no longer valid per new SSH policy; closing")
+	ss.ctx.CloseWithError(userVisibleError{
+		fmt.Sprintf("Access revoked.\r\n"),
+		context.Canceled,
+	})
+}
+
+func (c *conn) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHAction, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
-	bo := backoff.NewBackoff("fetch-ssh-action", srv.logf, 10*time.Second)
+	bo := backoff.NewBackoff("fetch-ssh-action", c.logf, 10*time.Second)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -346,7 +700,7 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 		if err != nil {
 			return nil, err
 		}
-		res, err := srv.lb.DoNoiseRequest(req)
+		res, err := c.srv.lb.DoNoiseRequest(req)
 		if err != nil {
 			bo.BackOff(ctx, err)
 			continue
@@ -357,7 +711,7 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 			if len(body) > 1<<10 {
 				body = body[:1<<10]
 			}
-			srv.logf("fetch of %v: %s, %s", url, res.Status, body)
+			c.logf("fetch of %v: %s, %s", url, res.Status, body)
 			bo.BackOff(ctx, fmt.Errorf("unexpected status: %v", res.Status))
 			continue
 		}
@@ -365,7 +719,7 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 		err = json.NewDecoder(res.Body).Decode(a)
 		res.Body.Close()
 		if err != nil {
-			srv.logf("invalid next SSHAction JSON from %v: %v", url, err)
+			c.logf("invalid next SSHAction JSON from %v: %v", url, err)
 			bo.BackOff(ctx, err)
 			continue
 		}
@@ -377,7 +731,7 @@ func (srv *server) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSH
 // unless the process has already exited.
 func (ss *sshSession) killProcessOnContextDone() {
 	<-ss.ctx.Done()
-	// Either the process has already existed, in which case this does nothing.
+	// Either the process has already exited, in which case this does nothing.
 	// Or, the process is still running in which case this will kill it.
 	ss.exitOnce.Do(func() {
 		err := ss.ctx.Err()
@@ -387,7 +741,9 @@ func (ss *sshSession) killProcessOnContextDone() {
 				io.WriteString(ss.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
 			}
 		}
-		ss.logf("terminating SSH session from %v: %v", ss.connInfo.src.IP(), err)
+		ss.logf("terminating SSH session from %v: %v", ss.conn.info.src.IP(), err)
+		// We don't need to Process.Wait here, sshSession.run() does
+		// the waiting regardless of termination reason.
 		ss.cmd.Process.Kill()
 	})
 }
@@ -404,26 +760,20 @@ func (srv *server) getSessionForContext(sctx ssh.Context) (ss *sshSession, ok bo
 func (srv *server) startSession(ss *sshSession) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	if srv.activeSessionByH == nil {
-		srv.activeSessionByH = make(map[string]*sshSession)
-	}
-	if srv.activeSessionBySharedID == nil {
-		srv.activeSessionBySharedID = make(map[string]*sshSession)
-	}
 	if ss.idH == "" {
 		panic("empty idH")
-	}
-	if _, dup := srv.activeSessionByH[ss.idH]; dup {
-		panic("dup idH")
 	}
 	if ss.sharedID == "" {
 		panic("empty sharedID")
 	}
+	if _, dup := srv.activeSessionByH[ss.idH]; dup {
+		panic("dup idH")
+	}
 	if _, dup := srv.activeSessionBySharedID[ss.sharedID]; dup {
 		panic("dup sharedID")
 	}
-	srv.activeSessionByH[ss.idH] = ss
-	srv.activeSessionBySharedID[ss.sharedID] = ss
+	mak.Set(&srv.activeSessionByH, ss.idH, ss)
+	mak.Set(&srv.activeSessionBySharedID, ss.sharedID, ss)
 }
 
 // endSession unregisters s from the list of active sessions.
@@ -437,7 +787,7 @@ func (srv *server) endSession(ss *sshSession) {
 var errSessionDone = errors.New("session is done")
 
 // handleSSHAgentForwarding starts a Unix socket listener and in the background
-// forwards agent connections between the listenr and the ssh.Session.
+// forwards agent connections between the listener and the ssh.Session.
 // On success, it assigns ss.agentListener.
 func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) error {
 	if !ssh.AgentRequested(ss) || !ss.action.AllowAgentForwarding {
@@ -464,10 +814,14 @@ func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) err
 	}
 	socket := ln.Addr().String()
 	dir := filepath.Dir(socket)
-	// Make sure the socket is accessible by the user.
+	// Make sure the socket is accessible only by the user.
+	if err := os.Chmod(socket, 0600); err != nil {
+		return err
+	}
 	if err := os.Chown(socket, int(uid), int(gid)); err != nil {
 		return err
 	}
+	// Make sure the dir is also accessible.
 	if err := os.Chmod(dir, 0755); err != nil {
 		return err
 	}
@@ -488,16 +842,16 @@ var recordSSH = envknob.Bool("TS_DEBUG_LOG_SSH")
 // It handles ss once it's been accepted and determined
 // that it should run.
 func (ss *sshSession) run() {
-	srv := ss.srv
+	srv := ss.conn.srv
 	srv.startSession(ss)
 	defer srv.endSession(ss)
 
 	defer ss.ctx.CloseWithError(errSessionDone)
 
-	if ss.action.SesssionDuration != 0 {
-		t := time.AfterFunc(ss.action.SesssionDuration, func() {
+	if ss.action.SessionDuration != 0 {
+		t := time.AfterFunc(ss.action.SessionDuration, func() {
 			ss.ctx.CloseWithError(userVisibleError{
-				fmt.Sprintf("Session timeout of %v elapsed.", ss.action.SesssionDuration),
+				fmt.Sprintf("Session timeout of %v elapsed.", ss.action.SessionDuration),
 				context.DeadlineExceeded,
 			})
 		})
@@ -505,13 +859,13 @@ func (ss *sshSession) run() {
 	}
 
 	logf := srv.logf
-	lu := ss.localUser
+	lu := ss.conn.localUser
 	localUser := lu.Username
 
 	if euid := os.Geteuid(); euid != 0 {
 		if lu.Uid != fmt.Sprint(euid) {
-			logf("ssh: can't switch to user %q from process euid %v", localUser, euid)
-			fmt.Fprintf(ss, "can't switch user\n")
+			ss.logf("can't switch to user %q from process euid %v", localUser, euid)
+			fmt.Fprintf(ss, "can't switch user\r\n")
 			ss.Exit(1)
 			return
 		}
@@ -521,27 +875,29 @@ func (ss *sshSession) run() {
 	// See https://github.com/tailscale/tailscale/issues/4146
 	ss.DisablePTYEmulation()
 
-	if err := ss.handleSSHAgentForwarding(ss, lu); err != nil {
-		logf("ssh: agent forwarding failed: %v", err)
-	} else if ss.agentListener != nil {
-		// TODO(maisem/bradfitz): add a way to close all session resources
-		defer ss.agentListener.Close()
-	}
-
 	var rec *recording // or nil if disabled
-	if ss.shouldRecord() {
-		var err error
-		rec, err = ss.startNewRecording()
-		if err != nil {
-			fmt.Fprintf(ss, "can't start new recording\n")
-			logf("startNewRecording: %v", err)
-			ss.Exit(1)
-			return
+	if ss.Subsystem() != "sftp" {
+		if err := ss.handleSSHAgentForwarding(ss, lu); err != nil {
+			ss.logf("agent forwarding failed: %v", err)
+		} else if ss.agentListener != nil {
+			// TODO(maisem/bradfitz): add a way to close all session resources
+			defer ss.agentListener.Close()
 		}
-		defer rec.Close()
+
+		if ss.shouldRecord() {
+			var err error
+			rec, err = ss.startNewRecording()
+			if err != nil {
+				fmt.Fprintf(ss, "can't start new recording\r\n")
+				ss.logf("startNewRecording: %v", err)
+				ss.Exit(1)
+				return
+			}
+			defer rec.Close()
+		}
 	}
 
-	err := ss.launchProcess(ss.ctx)
+	err := ss.launchProcess()
 	if err != nil {
 		logf("start failed: %v", err.Error())
 		ss.Exit(1)
@@ -581,18 +937,17 @@ func (ss *sshSession) run() {
 	ss.exitOnce.Do(func() {})
 
 	if err == nil {
-		logf("ssh: Wait: ok")
 		ss.Exit(0)
 		return
 	}
 	if ee, ok := err.(*exec.ExitError); ok {
 		code := ee.ProcessState.ExitCode()
-		logf("ssh: Wait: code=%v", code)
+		ss.logf("Wait: code=%v", code)
 		ss.Exit(code)
 		return
 	}
 
-	logf("ssh: Wait: %v", err)
+	ss.logf("Wait: %v", err)
 	ss.Exit(1)
 	return
 }
@@ -606,10 +961,6 @@ func (ss *sshSession) shouldRecord() bool {
 }
 
 type sshConnInfo struct {
-	// now is the time to consider the present moment for the
-	// purposes of rule evaluation.
-	now time.Time
-
 	// sshUser is the requested local SSH username ("root", "alice", etc).
 	sshUser string
 
@@ -626,9 +977,20 @@ type sshConnInfo struct {
 	uprof *tailcfg.UserProfile
 }
 
-func evalSSHPolicy(pol *tailcfg.SSHPolicy, ci *sshConnInfo) (a *tailcfg.SSHAction, localUser string, ok bool) {
+func (ci *sshConnInfo) String() string {
+	return fmt.Sprintf("%v->%v@%v", ci.src, ci.sshUser, ci.dst)
+}
+
+func (c *conn) ruleExpired(r *tailcfg.SSHRule) bool {
+	if r.RuleExpires == nil {
+		return false
+	}
+	return r.RuleExpires.Before(c.now)
+}
+
+func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, ok bool) {
 	for _, r := range pol.Rules {
-		if a, localUser, err := matchRule(r, ci); err == nil {
+		if a, localUser, err := c.matchRule(r, pubKey); err == nil {
 			return a, localUser, true
 		}
 	}
@@ -644,24 +1006,29 @@ var (
 	errUserMatch      = errors.New("user didn't match")
 )
 
-func matchRule(r *tailcfg.SSHRule, ci *sshConnInfo) (a *tailcfg.SSHAction, localUser string, err error) {
+func (c *conn) matchRule(r *tailcfg.SSHRule, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, err error) {
 	if r == nil {
 		return nil, "", errNilRule
 	}
 	if r.Action == nil {
 		return nil, "", errNilAction
 	}
-	if r.RuleExpires != nil && ci.now.After(*r.RuleExpires) {
+	if c.ruleExpired(r) {
 		return nil, "", errRuleExpired
 	}
-	if !matchesPrincipal(r.Principals, ci) {
-		return nil, "", errPrincipalMatch
-	}
-	if !r.Action.Reject || r.SSHUsers != nil {
-		localUser = mapLocalUser(r.SSHUsers, ci.sshUser)
+	if !r.Action.Reject {
+		// For all but Reject rules, SSHUsers is required.
+		// If SSHUsers is nil or empty, mapLocalUser will return an
+		// empty string anyway.
+		localUser = mapLocalUser(r.SSHUsers, c.info.sshUser)
 		if localUser == "" {
 			return nil, "", errUserMatch
 		}
+	}
+	if ok, err := c.anyPrincipalMatches(r.Principals, pubKey); err != nil {
+		return nil, "", err
+	} else if !ok {
+		return nil, "", errPrincipalMatch
 	}
 	return r.Action, localUser, nil
 }
@@ -677,27 +1044,83 @@ func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser 
 	return v
 }
 
-func matchesPrincipal(ps []*tailcfg.SSHPrincipal, ci *sshConnInfo) bool {
+func (c *conn) anyPrincipalMatches(ps []*tailcfg.SSHPrincipal, pubKey gossh.PublicKey) (bool, error) {
 	for _, p := range ps {
 		if p == nil {
 			continue
 		}
-		if p.Any {
-			return true
+		if ok, err := c.principalMatches(p, pubKey); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
 		}
-		if !p.Node.IsZero() && ci.node != nil && p.Node == ci.node.StableID {
-			return true
-		}
-		if p.NodeIP != "" {
-			if ip, _ := netaddr.ParseIP(p.NodeIP); ip == ci.src.IP() {
-				return true
-			}
-		}
-		if p.UserLogin != "" && ci.uprof != nil && ci.uprof.LoginName == p.UserLogin {
+	}
+	return false, nil
+}
+
+func (c *conn) principalMatches(p *tailcfg.SSHPrincipal, pubKey gossh.PublicKey) (bool, error) {
+	if !c.principalMatchesTailscaleIdentity(p) {
+		return false, nil
+	}
+	return c.principalMatchesPubKey(p, pubKey)
+}
+
+// principalMatchesTailscaleIdentity reports whether one of p's four fields
+// that match the Tailscale identity match (Node, NodeIP, UserLogin, Any).
+// This function does not consider PubKeys.
+func (c *conn) principalMatchesTailscaleIdentity(p *tailcfg.SSHPrincipal) bool {
+	ci := c.info
+	if p.Any {
+		return true
+	}
+	if !p.Node.IsZero() && ci.node != nil && p.Node == ci.node.StableID {
+		return true
+	}
+	if p.NodeIP != "" {
+		if ip, _ := netaddr.ParseIP(p.NodeIP); ip == ci.src.IP() {
 			return true
 		}
 	}
+	if p.UserLogin != "" && ci.uprof != nil && ci.uprof.LoginName == p.UserLogin {
+		return true
+	}
 	return false
+}
+
+func (c *conn) principalMatchesPubKey(p *tailcfg.SSHPrincipal, clientPubKey gossh.PublicKey) (bool, error) {
+	if len(p.PubKeys) == 0 {
+		return true, nil
+	}
+	if clientPubKey == nil {
+		return false, nil
+	}
+	knownKeys := p.PubKeys
+	if len(knownKeys) == 1 && strings.HasPrefix(knownKeys[0], "https://") {
+		var err error
+		knownKeys, err = c.srv.fetchPublicKeysURL(c.expandPublicKeyURL(knownKeys[0]))
+		if err != nil {
+			return false, err
+		}
+	}
+	for _, knownKey := range knownKeys {
+		if pubKeyMatchesAuthorizedKey(clientPubKey, knownKey) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func pubKeyMatchesAuthorizedKey(pubKey ssh.PublicKey, wantKey string) bool {
+	wantKeyType, rest, ok := strings.Cut(wantKey, " ")
+	if !ok {
+		return false
+	}
+	if pubKey.Type() != wantKeyType {
+		return false
+	}
+	wantKeyB64, _, _ := strings.Cut(rest, " ")
+	wantKeyData, _ := base64.StdEncoding.DecodeString(wantKeyB64)
+	return len(wantKeyData) > 0 && bytes.Equal(pubKey.Marshal(), wantKeyData)
 }
 
 func randBytes(n int) []byte {
@@ -728,7 +1151,7 @@ func (ss *sshSession) startNewRecording() (*recording, error) {
 		ss:    ss,
 		start: now,
 	}
-	varRoot := ss.srv.lb.TailscaleVarRoot()
+	varRoot := ss.conn.srv.lb.TailscaleVarRoot()
 	if varRoot == "" {
 		return nil, errors.New("no var root for recording storage")
 	}
@@ -831,7 +1254,7 @@ func (w loggingWriter) Write(p []byte) (n int, err error) {
 	}
 	j = append(j, '\n')
 	if err := w.writeCastLine(j); err != nil {
-		return 0, nil
+		return 0, err
 	}
 	return w.w.Write(p)
 }

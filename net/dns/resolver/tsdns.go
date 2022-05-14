@@ -17,6 +17,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,12 +26,9 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
 	"tailscale.com/net/dns/resolvconffile"
-	tspacket "tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
-	"tailscale.com/net/tstun"
 	"tailscale.com/types/dnstype"
-	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
@@ -39,41 +37,15 @@ import (
 
 const dnsSymbolicFQDN = "magicdns.localhost-tailscale-daemon."
 
-var (
-	magicDNSIP   = tsaddr.TailscaleServiceIP()
-	magicDNSIPv6 = tsaddr.TailscaleServiceIPv6()
-)
-
-const magicDNSPort = 53
-
 // maxResponseBytes is the maximum size of a response from a Resolver. The
 // actual buffer size will be one larger than this so that we can detect
 // truncation in a platform-agnostic way.
 const maxResponseBytes = 4095
 
-// maxActiveQueries returns the maximal number of DNS requests that be
-// can running.
-// If EnqueueRequest is called when this many requests are already pending,
-// the request will be dropped to avoid blocking the caller.
-func maxActiveQueries() int32 {
-	if runtime.GOOS == "ios" {
-		// For memory paranoia reasons on iOS, match the
-		// historical Tailscale 1.x..1.8 behavior for now
-		// (just before the 1.10 release).
-		return 64
-	}
-	// But for other platforms, allow more burstiness:
-	return 256
-}
-
 // defaultTTL is the TTL of all responses from Resolver.
 const defaultTTL = 600 * time.Second
 
-// ErrClosed indicates that the resolver has been closed and readers should exit.
-var ErrClosed = errors.New("closed")
-
 var (
-	errFullQueue  = errors.New("request queue full")
 	errNotQuery   = errors.New("not a DNS query")
 	errNotOurName = errors.New("not a Tailscale DNS name")
 )
@@ -94,7 +66,7 @@ type Config struct {
 	// queries within that suffix.
 	// Queries only match the most specific suffix.
 	// To register a "default route", add an entry for ".".
-	Routes map[dnsname.FQDN][]dnstype.Resolver
+	Routes map[dnsname.FQDN][]*dnstype.Resolver
 	// LocalHosts is a map of FQDNs to corresponding IPs.
 	Hosts map[dnsname.FQDN][]netaddr.IP
 	// LocalDomains is a list of DNS name suffixes that should not be
@@ -143,7 +115,7 @@ func WriteIPPorts(w *bufio.Writer, vv []netaddr.IPPort) {
 }
 
 // WriteDNSResolver writes r to w.
-func WriteDNSResolver(w *bufio.Writer, r dnstype.Resolver) {
+func WriteDNSResolver(w *bufio.Writer, r *dnstype.Resolver) {
 	io.WriteString(w, r.Addr)
 	if len(r.BootstrapResolution) > 0 {
 		w.WriteByte('(')
@@ -157,7 +129,7 @@ func WriteDNSResolver(w *bufio.Writer, r dnstype.Resolver) {
 }
 
 // WriteDNSResolvers writes resolvers to w.
-func WriteDNSResolvers(w *bufio.Writer, resolvers []dnstype.Resolver) {
+func WriteDNSResolvers(w *bufio.Writer, resolvers []*dnstype.Resolver) {
 	w.WriteByte('[')
 	for i, r := range resolvers {
 		if i > 0 {
@@ -170,7 +142,7 @@ func WriteDNSResolvers(w *bufio.Writer, resolvers []dnstype.Resolver) {
 
 // WriteRoutes writes routes to w, omitting *.arpa routes and instead
 // summarizing how many of them there were.
-func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]dnstype.Resolver) {
+func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]*dnstype.Resolver) {
 	var kk []dnsname.FQDN
 	arpa := 0
 	for k := range routes {
@@ -208,12 +180,6 @@ type Resolver struct {
 	// forwarder forwards requests to upstream nameservers.
 	forwarder *forwarder
 
-	activeQueriesAtomic int32 // number of DNS queries in flight
-
-	// responses is an unbuffered channel to which responses are returned.
-	responses chan packet
-	// errors is an unbuffered channel to which errors are returned.
-	errors chan error
 	// closed signals all goroutines to stop.
 	closed chan struct{}
 	// wg signals when all goroutines have stopped.
@@ -240,16 +206,14 @@ func New(logf logger.Logf, linkMon *monitor.Mon, linkSel ForwardLinkSelector, di
 		panic("nil Dialer")
 	}
 	r := &Resolver{
-		logf:      logger.WithPrefix(logf, "resolver: "),
-		linkMon:   linkMon,
-		responses: make(chan packet),
-		errors:    make(chan error),
-		closed:    make(chan struct{}),
-		hostToIP:  map[dnsname.FQDN][]netaddr.IP{},
-		ipToHost:  map[netaddr.IP]dnsname.FQDN{},
-		dialer:    dialer,
+		logf:     logger.WithPrefix(logf, "resolver: "),
+		linkMon:  linkMon,
+		closed:   make(chan struct{}),
+		hostToIP: map[dnsname.FQDN][]netaddr.IP{},
+		ipToHost: map[netaddr.IP]dnsname.FQDN{},
+		dialer:   dialer,
 	}
-	r.forwarder = newForwarder(r.logf, r.responses, linkMon, linkSel, dialer)
+	r.forwarder = newForwarder(r.logf, linkMon, linkSel, dialer)
 	return r
 }
 
@@ -292,94 +256,29 @@ func (r *Resolver) Close() {
 	r.forwarder.Close()
 }
 
-// EnqueuePacket handles a packet to the magicDNS endpoint.
-// It takes ownership of the payload and does not block.
-// If the queue is full, the request will be dropped and an error will be returned.
-func (r *Resolver) EnqueuePacket(bs []byte, proto ipproto.Proto, from, to netaddr.IPPort) error {
-	if to.Port() != magicDNSPort || proto != ipproto.UDP {
-		return nil
-	}
-
-	return r.enqueueRequest(bs, proto, from, to)
-}
-
-// enqueueRequest places the given DNS request in the resolver's queue.
-// If the queue is full, the request will be dropped and an error will be returned.
-func (r *Resolver) enqueueRequest(bs []byte, proto ipproto.Proto, from, to netaddr.IPPort) error {
+func (r *Resolver) Query(ctx context.Context, bs []byte, from netaddr.IPPort) ([]byte, error) {
 	metricDNSQueryLocal.Add(1)
 	select {
 	case <-r.closed:
 		metricDNSQueryErrorClosed.Add(1)
-		return ErrClosed
+		return nil, net.ErrClosed
 	default:
 	}
-	if n := atomic.AddInt32(&r.activeQueriesAtomic, 1); n > maxActiveQueries() {
-		atomic.AddInt32(&r.activeQueriesAtomic, -1)
-		metricDNSQueryErrorQueue.Add(1)
-		return errFullQueue
-	}
-	go r.handleQuery(packet{bs, from})
-	return nil
-}
 
-// NextPacket returns the next packet to service traffic for magicDNS. The returned
-// packet is prefixed with unused space consistent with the semantics of injection
-// into tstun.Wrapper.
-// It blocks until a response is available and gives up ownership of the response payload.
-func (r *Resolver) NextPacket() (ipPacket []byte, err error) {
-	bs, to, err := r.nextResponse()
-	if err != nil {
-		return nil, err
-	}
-
-	// Unused space is needed further down the stack. To avoid extra
-	// allocations/copying later on, we allocate such space here.
-	const offset = tstun.PacketStartOffset
-
-	var buf []byte
-	switch {
-	case to.IP().Is4():
-		h := tspacket.UDP4Header{
-			IP4Header: tspacket.IP4Header{
-				Src: magicDNSIP,
-				Dst: to.IP(),
-			},
-			SrcPort: magicDNSPort,
-			DstPort: to.Port(),
+	out, err := r.respond(bs)
+	if err == errNotOurName {
+		responses := make(chan packet, 1)
+		ctx, cancel := context.WithCancel(ctx)
+		defer close(responses)
+		defer cancel()
+		err = r.forwarder.forwardWithDestChan(ctx, packet{bs, from}, responses)
+		if err != nil {
+			return nil, err
 		}
-		hlen := h.Len()
-		buf = make([]byte, offset+hlen+len(bs))
-		copy(buf[offset+hlen:], bs)
-		h.Marshal(buf[offset:])
-	case to.IP().Is6():
-		h := tspacket.UDP6Header{
-			IP6Header: tspacket.IP6Header{
-				Src: magicDNSIPv6,
-				Dst: to.IP(),
-			},
-			SrcPort: magicDNSPort,
-			DstPort: to.Port(),
-		}
-		hlen := h.Len()
-		buf = make([]byte, offset+hlen+len(bs))
-		copy(buf[offset+hlen:], bs)
-		h.Marshal(buf[offset:])
+		return (<-responses).bs, nil
 	}
 
-	return buf, nil
-}
-
-// nextResponse returns a DNS response to a previously enqueued request.
-// It blocks until a response is available and gives up ownership of the response payload.
-func (r *Resolver) nextResponse() (packet []byte, to netaddr.IPPort, err error) {
-	select {
-	case <-r.closed:
-		return nil, netaddr.IPPort{}, ErrClosed
-	case resp := <-r.responses:
-		return resp.bs, resp.addr, nil
-	case err := <-r.errors:
-		return nil, netaddr.IPPort{}, err
-	}
+	return out, err
 }
 
 // parseExitNodeQuery parses a DNS request packet.
@@ -448,7 +347,7 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 			// will use its default ones from our DNS config.
 		} else {
 			resolvers = []resolverAndDelay{{
-				name: dnstype.Resolver{Addr: net.JoinHostPort(nameserver.String(), "53")},
+				name: &dnstype.Resolver{Addr: net.JoinHostPort(nameserver.String(), "53")},
 			}}
 		}
 
@@ -633,6 +532,10 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netaddr.IP, 
 			return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
 		}
 	}
+	// Special-case: 'via-<siteid>.<ipv4>' queries.
+	if ip, ok := r.parseViaDomain(domain, typ); ok {
+		return ip, dns.RCodeSuccess
+	}
 
 	r.mu.Lock()
 	hosts := r.hostToIP
@@ -708,6 +611,46 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netaddr.IP, 
 	}
 }
 
+// parseViaDomain synthesizes an IP address for quad-A DNS requests of
+// the form 'via-<X>.<IPv4-address>', where X is a decimal, or hex-encoded
+// number with a '0x' prefix.
+//
+// This exists as a convenient mapping into Tailscales 'Via Range'.
+func (r *Resolver) parseViaDomain(domain dnsname.FQDN, typ dns.Type) (netaddr.IP, bool) {
+	fqdn := string(domain.WithoutTrailingDot())
+	if typ != dns.TypeAAAA {
+		return netaddr.IP{}, false
+	}
+	if len(fqdn) < len("via-X.0.0.0.0") {
+		return netaddr.IP{}, false // too short to be valid
+	}
+	if !strings.HasPrefix(fqdn, "via-") {
+		return netaddr.IP{}, false
+	}
+
+	firstDot := strings.Index(fqdn, ".")
+	if firstDot < 0 {
+		return netaddr.IP{}, false // missing dot delimiters
+	}
+
+	siteID := fqdn[len("via-"):firstDot]
+	ip4Str := fqdn[firstDot+1:]
+
+	ip4, err := netaddr.ParseIP(ip4Str)
+	if err != nil {
+		return netaddr.IP{}, false // badly formed, dont respond
+	}
+
+	prefix, err := strconv.ParseUint(siteID, 0, 32)
+	if err != nil {
+		return netaddr.IP{}, false // badly formed, dont respond
+	}
+
+	// MapVia will never error when given an ipv4 netaddr.IPPrefix.
+	out, _ := tsaddr.MapVia(uint32(prefix), netaddr.IPPrefixFrom(ip4, ip4.BitLen()))
+	return out.IP(), true
+}
+
 // resolveReverse returns the unique domain name that maps to the given address.
 func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCode) {
 	var ip netaddr.IP
@@ -725,6 +668,22 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
 		return "", dns.RCodeRefused
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// If the requested IP is part of the IPv6 4-to-6 range, it might
+	// correspond to an IPv4 address (assuming IPv4 is enabled).
+	if ip4, ok := tsaddr.Tailscale6to4(ip); ok {
+		fqdn, code := r.fqdnForIPLocked(ip4, name)
+		if code == dns.RCodeSuccess {
+			return fqdn, code
+		}
+	}
+	return r.fqdnForIPLocked(ip, name)
+}
+
+// r.mu must be held.
+func (r *Resolver) fqdnForIPLocked(ip netaddr.IP, name dnsname.FQDN) (dnsname.FQDN, dns.RCode) {
 	// If someone curiously does a reverse lookup on the DNS IP, we
 	// return a domain that helps indicate that Tailscale is using
 	// this IP for a special purpose and it is not a node on their
@@ -733,8 +692,6 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
 		return dnsSymbolicFQDN, dns.RCodeSuccess
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	ret, ok := r.ipToHost[ip]
 	if !ok {
 		for _, suffix := range r.localDomains {
@@ -747,30 +704,6 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
 		return "", dns.RCodeRefused
 	}
 	return ret, dns.RCodeSuccess
-}
-
-func (r *Resolver) handleQuery(pkt packet) {
-	defer atomic.AddInt32(&r.activeQueriesAtomic, -1)
-
-	out, err := r.respond(pkt.bs)
-	if err == errNotOurName {
-		err = r.forwarder.forward(pkt)
-		if err == nil {
-			// forward will send response into r.responses, nothing to do.
-			return
-		}
-	}
-	if err != nil {
-		select {
-		case <-r.closed:
-		case r.errors <- err:
-		}
-	} else {
-		select {
-		case <-r.closed:
-		case r.responses <- packet{out, pkt.addr}:
-		}
-	}
 }
 
 type response struct {
@@ -1257,7 +1190,6 @@ func unARPA(a string) (ipStr string, ok bool) {
 var (
 	metricDNSQueryLocal       = clientmetric.NewCounter("dns_query_local")
 	metricDNSQueryErrorClosed = clientmetric.NewCounter("dns_query_local_error_closed")
-	metricDNSQueryErrorQueue  = clientmetric.NewCounter("dns_query_local_error_queue")
 
 	metricDNSErrorParseNoQ   = clientmetric.NewCounter("dns_query_respond_error_no_question")
 	metricDNSErrorParseQuery = clientmetric.NewCounter("dns_query_respond_error_parse")
@@ -1281,6 +1213,7 @@ var (
 
 	metricDNSFwdErrorType      = clientmetric.NewCounter("dns_query_fwd_error_type")
 	metricDNSFwdErrorParseAddr = clientmetric.NewCounter("dns_query_fwd_error_parse_addr")
+	metricDNSFwdTruncated      = clientmetric.NewCounter("dns_query_fwd_truncated")
 
 	metricDNSFwdUDP            = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
 	metricDNSFwdUDPWrote       = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet

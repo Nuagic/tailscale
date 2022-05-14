@@ -25,7 +25,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -130,14 +129,6 @@ var subCommands = map[string]*func([]string) error{
 }
 
 func main() {
-	// We aren't very performance sensitive, and the parts that are
-	// performance sensitive (wireguard) try hard not to do any memory
-	// allocations. So let's be aggressive about garbage collection,
-	// unless the user specifically overrides it in the usual way.
-	if _, ok := os.LookupEnv("GOGC"); !ok {
-		debug.SetGCPercent(10)
-	}
-
 	printVersion := false
 	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
 	flag.BoolVar(&args.cleanup, "cleanup", false, "clean up system state and exit")
@@ -146,7 +137,7 @@ func main() {
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, 0), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
-	flag.StringVar(&args.statepath, "state", paths.DefaultTailscaledStateFile(), "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an emphemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state")
+	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an emphemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
@@ -194,6 +185,12 @@ func main() {
 	if args.birdSocketPath != "" && createBIRDClient == nil {
 		log.SetFlags(0)
 		log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
+	}
+
+	// Only apply a default statepath when neither have been provided, so that a
+	// user may specify only --statedir if they wish.
+	if args.statepath == "" && args.statedir == "" {
+		args.statepath = paths.DefaultTailscaledStateFile()
 	}
 
 	err := run()
@@ -341,6 +338,7 @@ func run() error {
 	socksListener, httpProxyListener := mustStartProxyListeners(args.socksAddr, args.httpProxyAddr)
 
 	dialer := new(tsdial.Dialer) // mutated below (before used)
+	dialer.Logf = logf
 	e, useNetstack, err := createEngine(logf, linkMon, dialer)
 	if err != nil {
 		return fmt.Errorf("createEngine: %w", err)
@@ -350,7 +348,7 @@ func run() error {
 	}
 	if debugMux != nil {
 		if ig, ok := e.(wgengine.InternalsGetter); ok {
-			if _, mc, ok := ig.GetInternals(); ok {
+			if _, mc, _, ok := ig.GetInternals(); ok {
 				debugMux.HandleFunc("/debug/magicsock", mc.ServeHTTPDebug)
 			}
 		}
@@ -403,6 +401,7 @@ func run() error {
 	// want to keep running.
 	signal.Ignore(syscall.SIGPIPE)
 	go func() {
+		defer dialer.Close()
 		select {
 		case s := <-interrupt:
 			logf("tailscaled got signal %v; shutting down", s)
@@ -573,11 +572,11 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 }
 
 func newNetstack(logf logger.Logf, dialer *tsdial.Dialer, e wgengine.Engine) (*netstack.Impl, error) {
-	tunDev, magicConn, ok := e.(wgengine.InternalsGetter).GetInternals()
+	tunDev, magicConn, dns, ok := e.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
 		return nil, fmt.Errorf("%T is not a wgengine.InternalsGetter", e)
 	}
-	return netstack.Create(logf, tunDev, e, magicConn, dialer)
+	return netstack.Create(logf, tunDev, e, magicConn, dialer, dns)
 }
 
 // mustStartProxyListeners creates listeners for local SOCKS and HTTP
