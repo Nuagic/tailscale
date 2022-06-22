@@ -81,6 +81,9 @@ type SSHServer interface {
 	// so that existing sessions can be re-evaluated for validity
 	// and closed if they'd no longer be accepted.
 	OnPolicyChange()
+
+	// Shutdown is called when tailscaled is shutting down.
+	Shutdown()
 }
 
 type newSSHServerFunc func(logger.Logf, *LocalBackend) (SSHServer, error)
@@ -122,8 +125,7 @@ type LocalBackend struct {
 	newDecompressor       func() (controlclient.Decompressor, error)
 	varRoot               string // or empty if SetVarRoot never called
 	sshAtomicBool         syncs.AtomicBool
-	sshServer             SSHServer // or nil
-	shutdownCalled        bool      // if Shutdown has been called
+	shutdownCalled        bool // if Shutdown has been called
 
 	filterAtomic            atomic.Value // of *filter.Filter
 	containsViaIPFuncAtomic atomic.Value // of func(netaddr.IP) bool
@@ -133,10 +135,12 @@ type LocalBackend struct {
 	filterHash     deephash.Sum
 	httpTestClient *http.Client // for controlclient. nil by default, used by tests.
 	ccGen          clientGen    // function for producing controlclient; lazily populated
+	sshServer      SSHServer    // or nil, initialized lazily.
 	notify         func(ipn.Notify)
 	cc             controlclient.Client
-	stateKey       ipn.StateKey // computed in part from user-provided value
-	userID         string       // current controlling user ID (for Windows, primarily)
+	ccAuto         *controlclient.Auto // if cc is of type *controlclient.Auto
+	stateKey       ipn.StateKey        // computed in part from user-provided value
+	userID         string              // current controlling user ID (for Windows, primarily)
 	prefs          *ipn.Prefs
 	inServerMode   bool
 	machinePrivKey key.MachinePrivate
@@ -224,12 +228,6 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, diale
 		portpoll:       portpoll,
 		gotPortPollRes: make(chan struct{}),
 		loginFlags:     loginFlags,
-	}
-	if newSSHServer != nil {
-		b.sshServer, err = newSSHServer(logf, b)
-		if err != nil {
-			return nil, fmt.Errorf("newSSHServer: %w", err)
-		}
 	}
 
 	// Default filter blocks everything and logs nothing, until Start() is called.
@@ -346,6 +344,10 @@ func (b *LocalBackend) Shutdown() {
 	b.mu.Lock()
 	b.shutdownCalled = true
 	cc := b.cc
+	if b.sshServer != nil {
+		b.sshServer.Shutdown()
+		b.sshServer = nil
+	}
 	b.closePeerAPIListenersLocked()
 	b.mu.Unlock()
 
@@ -415,6 +417,9 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 				s.Health = append(s.Health, err.Error())
 			}
 		}
+		if m := b.sshOnButUnusableHealthCheckMessageLocked(); m != "" {
+			s.Health = append(s.Health, m)
+		}
 		if b.netMap != nil {
 			s.CertDomains = append([]string(nil), b.netMap.DNS.CertDomains...)
 			s.MagicDNSSuffix = b.netMap.MagicDNSSuffix()
@@ -424,6 +429,20 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 			s.CurrentTailnet.MagicDNSSuffix = b.netMap.MagicDNSSuffix()
 			s.CurrentTailnet.MagicDNSEnabled = b.netMap.DNS.Proxied
 			s.CurrentTailnet.Name = b.netMap.Domain
+			if b.prefs != nil && !b.prefs.ExitNodeID.IsZero() {
+				if exitPeer, ok := b.netMap.PeerWithStableID(b.prefs.ExitNodeID); ok {
+					var online = false
+					if exitPeer.Online != nil {
+						online = *exitPeer.Online
+					}
+					s.ExitNodeStatus = &ipnstate.ExitNodeStatus{
+						ID:           b.prefs.ExitNodeID,
+						Online:       online,
+						TailscaleIPs: exitPeer.Addresses,
+					}
+				}
+
+			}
 		}
 	})
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
@@ -778,7 +797,7 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 
 	if cc != nil {
 		if needUpdateEndpoints {
-			cc.UpdateEndpoints(0, s.LocalAddrs)
+			cc.UpdateEndpoints(s.LocalAddrs)
 		}
 		b.stateMachine()
 	}
@@ -1034,9 +1053,10 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		DiscoPublicKey:       discoPublic,
 		DebugFlags:           debugFlags,
 		LinkMonitor:          b.e.GetLinkMonitor(),
-		Pinger:               b.e,
+		Pinger:               b,
 		PopBrowserURL:        b.tellClientToBrowseToURL,
 		Dialer:               b.Dialer(),
+		Status:               b.setClientStatus,
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
@@ -1048,14 +1068,14 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 
 	b.mu.Lock()
 	b.cc = cc
+	b.ccAuto, _ = cc.(*controlclient.Auto)
 	endpoints := b.endpoints
 	b.mu.Unlock()
 
 	if endpoints != nil {
-		cc.UpdateEndpoints(0, endpoints)
+		cc.UpdateEndpoints(endpoints)
 	}
 
-	cc.SetStatusFunc(b.setClientStatus)
 	b.e.SetNetInfoCallback(b.setNetInfo)
 
 	b.mu.Lock()
@@ -1700,6 +1720,27 @@ func (b *LocalBackend) StartLoginInteractive() {
 }
 
 func (b *LocalBackend) Ping(ctx context.Context, ip netaddr.IP, pingType tailcfg.PingType) (*ipnstate.PingResult, error) {
+	if pingType == tailcfg.PingPeerAPI {
+		t0 := time.Now()
+		node, base, err := b.pingPeerAPI(ctx, ip)
+		if err != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		d := time.Since(t0)
+		pr := &ipnstate.PingResult{
+			IP:             ip.String(),
+			NodeIP:         ip.String(),
+			LatencySeconds: d.Seconds(),
+			PeerAPIURL:     base,
+		}
+		if err != nil {
+			pr.Err = err.Error()
+		}
+		if node != nil {
+			pr.NodeName = node.Name
+		}
+		return pr, nil
+	}
 	ch := make(chan *ipnstate.PingResult, 1)
 	b.e.Ping(ip, pingType, func(pr *ipnstate.PingResult) {
 		select {
@@ -1713,6 +1754,37 @@ func (b *LocalBackend) Ping(ctx context.Context, ip netaddr.IP, pingType tailcfg
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (b *LocalBackend) pingPeerAPI(ctx context.Context, ip netaddr.IP) (peer *tailcfg.Node, peerBase string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	nm := b.NetMap()
+	if nm == nil {
+		return nil, "", errors.New("no netmap")
+	}
+	peer, ok := nm.PeerByTailscaleIP(ip)
+	if !ok {
+		return nil, "", fmt.Errorf("no peer found with Tailscale IP %v", ip)
+	}
+	base := peerAPIBase(nm, peer)
+	if base == "" {
+		return nil, "", fmt.Errorf("no peer API base found for peer %v (%v)", peer.ID, ip)
+	}
+	outReq, err := http.NewRequestWithContext(ctx, "HEAD", base, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	tr := b.Dialer().PeerAPITransport()
+	res, err := tr.RoundTrip(outReq)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close() // but unnecessary on HEAD responses
+	if res.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP status %v", res.Status)
+	}
+	return peer, base, nil
 }
 
 // parseWgStatusLocked returns an EngineStatus based on s.
@@ -1773,34 +1845,86 @@ func (b *LocalBackend) CheckPrefs(p *ipn.Prefs) error {
 }
 
 func (b *LocalBackend) checkPrefsLocked(p *ipn.Prefs) error {
+	var errs []error
 	if p.Hostname == "badhostname.tailscale." {
 		// Keep this one just for testing.
-		return errors.New("bad hostname [test]")
+		errs = append(errs, errors.New("bad hostname [test]"))
 	}
-	if p.RunSSH {
-		switch runtime.GOOS {
-		case "linux":
-			// okay
-		case "darwin":
-			// okay only in tailscaled mode for now.
-			if version.IsSandboxedMacOS() {
-				return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
-			}
-			if !envknob.UseWIPCode() {
-				return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
-			}
-		default:
-			return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+	if err := b.checkSSHPrefsLocked(p); err != nil {
+		errs = append(errs, err)
+	}
+	return multierr.New(errs...)
+}
+
+func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
+	if !p.RunSSH {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "linux":
+		if distro.Get() == distro.Synology && !envknob.UseWIPCode() {
+			return errors.New("The Tailscale SSH server does not run on Synology.")
 		}
-		if !canSSH {
-			return errors.New("The Tailscale SSH server has been administratively disabled.")
+		// otherwise okay
+	case "darwin":
+		// okay only in tailscaled mode for now.
+		if version.IsSandboxedMacOS() {
+			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
 		}
-		if b.netMap != nil && b.netMap.SSHPolicy == nil &&
-			envknob.SSHPolicyFile() == "" && !envknob.SSHIgnoreTailnetPolicy() {
-			return errors.New("Unable to enable local Tailscale SSH server; not enabled/configured on Tailnet.")
+		if !envknob.UseWIPCode() {
+			return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
+		}
+	default:
+		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+	}
+	if !canSSH {
+		return errors.New("The Tailscale SSH server has been administratively disabled.")
+	}
+	if envknob.SSHIgnoreTailnetPolicy() || envknob.SSHPolicyFile() != "" {
+		return nil
+	}
+	if b.netMap != nil {
+		if !hasCapability(b.netMap, tailcfg.CapabilitySSH) {
+			if b.isDefaultServerLocked() {
+				return errors.New("Unable to enable local Tailscale SSH server; not enabled on Tailnet. See https://tailscale.com/s/ssh")
+			}
+			return errors.New("Unable to enable local Tailscale SSH server; not enabled on Tailnet.")
 		}
 	}
 	return nil
+}
+
+func (b *LocalBackend) sshOnButUnusableHealthCheckMessageLocked() (healthMessage string) {
+	if b.prefs == nil || !b.prefs.RunSSH {
+		return ""
+	}
+	if envknob.SSHIgnoreTailnetPolicy() || envknob.SSHPolicyFile() != "" {
+		return "development SSH policy in use"
+	}
+	nm := b.netMap
+	if nm == nil {
+		return ""
+	}
+	if nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0 {
+		return ""
+	}
+	isDefault := b.isDefaultServerLocked()
+	isAdmin := hasCapability(nm, tailcfg.CapabilityAdmin)
+
+	if !isAdmin {
+		return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Ask your admin to update your tailnet's ACLs to allow access."
+	}
+	if !isDefault {
+		return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Update your tailnet's ACLs to allow access."
+	}
+	return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Update your tailnet's ACLs at https://tailscale.com/s/ssh-policy"
+}
+
+func (b *LocalBackend) isDefaultServerLocked() bool {
+	if b.prefs == nil {
+		return true // assume true until set otherwise
+	}
+	return b.prefs.ControlURLOrDefault() == ipn.DefaultControlURL
 }
 
 func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
@@ -1874,6 +1998,12 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 	}
 	b.updateFilterLocked(netMap, newp)
 
+	if oldp.ShouldSSHBeRunning() && !newp.ShouldSSHBeRunning() {
+		if b.sshServer != nil {
+			go b.sshServer.Shutdown()
+			b.sshServer = nil
+		}
+	}
 	b.mu.Unlock()
 
 	if stateKey != "" {
@@ -1915,10 +2045,6 @@ func (b *LocalBackend) setPrefsLockedOnEntry(caller string, newp *ipn.Prefs) {
 		b.stateMachine()
 	} else {
 		b.authReconfig()
-	}
-
-	if oldp.RunSSH && !newp.RunSSH && b.sshServer != nil {
-		go b.sshServer.OnPolicyChange()
 	}
 
 	b.send(ipn.Notify{Prefs: newp})
@@ -2625,12 +2751,14 @@ func (b *LocalBackend) enterState(newState ipn.State) {
 	b.maybePauseControlClientLocked()
 	b.mu.Unlock()
 
+	// prefs may change irrespective of state; WantRunning should be explicitly
+	// set before potential early return even if the state is unchanged.
+	health.SetIPNState(newState.String(), prefs.WantRunning)
 	if oldState == newState {
 		return
 	}
 	b.logf("Switching ipn state %v -> %v (WantRunning=%v, nm=%v)",
 		oldState, newState, prefs.WantRunning, netMap != nil)
-	health.SetIPNState(newState.String(), prefs.WantRunning)
 	b.send(ipn.Notify{State: &newState})
 
 	switch newState {
@@ -3034,7 +3162,7 @@ func (b *LocalBackend) FileTargets() ([]*apitype.FileTarget, error) {
 	defer b.mu.Unlock()
 	nm := b.netMap
 	if b.state != ipn.Running || nm == nil {
-		return nil, errors.New("not connected")
+		return nil, errors.New("not connected to the tailnet")
 	}
 	if !b.capFileSharing {
 		return nil, errors.New("file sharing not enabled by Tailscale admin")
@@ -3073,7 +3201,7 @@ func (b *LocalBackend) SetDNS(ctx context.Context, name, value string) error {
 	}
 
 	b.mu.Lock()
-	cc := b.cc
+	cc := b.ccAuto
 	if prefs := b.prefs; prefs != nil {
 		req.NodeKey = prefs.Persist.PrivateNodeKey.Public()
 	}
@@ -3241,7 +3369,13 @@ func (b *LocalBackend) allowExitNodeDNSProxyToServeName(name string) bool {
 // If t is in the past, the key is expired immediately.
 // If t is after the current expiry, an error is returned.
 func (b *LocalBackend) SetExpirySooner(ctx context.Context, expiry time.Time) error {
-	return b.cc.SetExpirySooner(ctx, expiry)
+	b.mu.Lock()
+	cc := b.ccAuto
+	b.mu.Unlock()
+	if cc == nil {
+		return errors.New("not running")
+	}
+	return cc.SetExpirySooner(ctx, expiry)
 }
 
 // exitNodeCanProxyDNS reports the DoH base URL ("http://foo/dns-query") without query parameters
@@ -3301,7 +3435,7 @@ func (b *LocalBackend) magicConn() (*magicsock.Conn, error) {
 // Noise connection.
 func (b *LocalBackend) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 	b.mu.Lock()
-	cc := b.cc
+	cc := b.ccAuto
 	b.mu.Unlock()
 	if cc == nil {
 		return nil, errors.New("no client")
@@ -3309,11 +3443,28 @@ func (b *LocalBackend) DoNoiseRequest(req *http.Request) (*http.Response, error)
 	return cc.DoNoiseRequest(req)
 }
 
-func (b *LocalBackend) HandleSSHConn(c net.Conn) error {
-	if b.sshServer == nil {
-		return errors.New("no SSH server")
+func (b *LocalBackend) sshServerOrInit() (_ SSHServer, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sshServer != nil {
+		return b.sshServer, nil
 	}
-	return b.sshServer.HandleSSHConn(c)
+	if newSSHServer == nil {
+		return nil, errors.New("no SSH server support")
+	}
+	b.sshServer, err = newSSHServer(b.logf, b)
+	if err != nil {
+		return nil, fmt.Errorf("newSSHServer: %w", err)
+	}
+	return b.sshServer, nil
+}
+
+func (b *LocalBackend) HandleSSHConn(c net.Conn) (err error) {
+	s, err := b.sshServerOrInit()
+	if err != nil {
+		return err
+	}
+	return s.HandleSSHConn(c)
 }
 
 // HandleQuad100Port80Conn serves http://100.100.100.100/ on port 80 (and

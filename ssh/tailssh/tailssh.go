@@ -41,6 +41,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
 )
 
@@ -58,11 +59,14 @@ type server struct {
 	pubKeyHTTPClient *http.Client     // or nil for http.DefaultClient
 	timeNow          func() time.Time // or nil for time.Now
 
+	sessionWaitGroup sync.WaitGroup
+
 	// mu protects the following
 	mu                      sync.Mutex
 	activeSessionByH        map[string]*sshSession      // ssh.SessionID (DH H) => session
 	activeSessionBySharedID map[string]*sshSession      // yyymmddThhmmss-XXXXX => session
 	fetchPublicKeysCache    map[string]pubKeyCacheEntry // by https URL
+	shutdownCalled          bool
 }
 
 func (srv *server) now() time.Time {
@@ -89,6 +93,7 @@ func init() {
 
 // HandleSSHConn handles a Tailscale SSH connection from c.
 func (srv *server) HandleSSHConn(c net.Conn) error {
+	metricIncomingConnections.Add(1)
 	ss, err := srv.newConn()
 	if err != nil {
 		return err
@@ -99,6 +104,20 @@ func (srv *server) HandleSSHConn(c net.Conn) error {
 	// log. If ss.HandleConn had problems, it can log itself (ideally on an
 	// sshSession.logf).
 	return nil
+}
+
+// Shutdown terminates all active sessions.
+func (srv *server) Shutdown() {
+	srv.mu.Lock()
+	srv.shutdownCalled = true
+	for _, s := range srv.activeSessionByH {
+		s.ctx.CloseWithError(userVisibleError{
+			fmt.Sprintf("Tailscale SSH is shutting down.\r\n"),
+			context.Canceled,
+		})
+	}
+	srv.mu.Unlock()
+	srv.sessionWaitGroup.Wait()
 }
 
 // OnPolicyChange terminates any active sessions that no longer match
@@ -227,6 +246,15 @@ func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
 }
 
 func (srv *server) newConn() (*conn, error) {
+	srv.mu.Lock()
+	shutdownCalled := srv.shutdownCalled
+	srv.mu.Unlock()
+	if shutdownCalled {
+		// Stop accepting new connections.
+		// Connections in the auth phase are handled in handleConnPostSSHAuth.
+		// Existing sessions are terminated by Shutdown.
+		return nil, gossh.ErrDenied
+	}
 	c := &conn{srv: srv, now: srv.now()}
 	c.Server = &ssh.Server{
 		Version:         "Tailscale",
@@ -275,7 +303,11 @@ func (srv *server) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string
 	if !ok {
 		return false
 	}
-	return ss.action.AllowLocalPortForwarding
+	if !ss.action.AllowLocalPortForwarding {
+		return false
+	}
+	metricLocalPortForward.Add(1)
+	return true
 }
 
 // havePubKeyPolicy reports whether any policy rule may provide access by means
@@ -488,6 +520,9 @@ func (srv *server) fetchPublicKeysURL(url string) ([]string, error) {
 // but not necessarily before all the Tailscale-level extra verification has
 // completed. It also handles SFTP requests.
 func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
+	if s.PublicKey() != nil {
+		metricPublicKeyConnections.Add(1)
+	}
 	sshUser := s.User()
 	cr := &contextReader{r: s}
 	action, err := c.resolveTerminalAction(s, cr)
@@ -502,6 +537,9 @@ func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
 		s.Exit(1)
 		return
 	}
+	if s.PublicKey() != nil {
+		metricPublicKeyAccepts.Add(1)
+	}
 
 	if cr.HasOutstandingRead() {
 		s = contextReaderSesssion{s, cr}
@@ -510,8 +548,9 @@ func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
 	// Do this check after auth, but before starting the session.
 	switch s.Subsystem() {
 	case "sftp", "":
+		metricSFTP.Add(1)
 	default:
-		fmt.Fprintf(s.Stderr(), "Unsupported subsystem %q \r\n", s.Subsystem())
+		fmt.Fprintf(s.Stderr(), "Unsupported subsystem %q\r\n", s.Subsystem())
 		s.Exit(1)
 		return
 	}
@@ -550,12 +589,19 @@ func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg
 			io.WriteString(s.Stderr(), strings.Replace(action.Message, "\n", "\r\n", -1))
 		}
 		if action.Accept || action.Reject {
+			if action.Reject {
+				metricTerminalReject.Add(1)
+			} else {
+				metricTerminalAccept.Add(1)
+			}
 			return action, nil
 		}
 		url := action.HoldAndDelegate
 		if url == "" {
+			metricTerminalMalformed.Add(1)
 			return nil, errors.New("reached Action that lacked Accept, Reject, and HoldAndDelegate")
 		}
+		metricHolds.Add(1)
 		awaitReadOnce.Do(func() {
 			wg.Add(1)
 			go func() {
@@ -580,7 +626,10 @@ func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg
 		action, err = c.fetchSSHAction(ctx, url)
 		if err != nil {
 			if sawInterrupt.Get() {
+				metricTerminalInterrupt.Add(1)
 				return nil, fmt.Errorf("aborted by user")
+			} else {
+				metricTerminalFetchError.Add(1)
 			}
 			return nil, fmt.Errorf("fetching SSHAction from %s: %w", url, err)
 		}
@@ -681,6 +730,7 @@ func (ss *sshSession) checkStillValid() {
 	if ss.conn.isStillValid(ss.PublicKey()) {
 		return
 	}
+	metricPolicyChangeKick.Add(1)
 	ss.logf("session no longer valid per new SSH policy; closing")
 	ss.ctx.CloseWithError(userVisibleError{
 		fmt.Sprintf("Access revoked.\r\n"),
@@ -756,10 +806,10 @@ func (srv *server) getSessionForContext(sctx ssh.Context) (ss *sshSession, ok bo
 	return
 }
 
-// startSession registers ss as an active session.
-func (srv *server) startSession(ss *sshSession) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
+// startSessionLocked registers ss as an active session.
+// It must be called with srv.mu held.
+func (srv *server) startSessionLocked(ss *sshSession) {
+	srv.sessionWaitGroup.Add(1)
 	if ss.idH == "" {
 		panic("empty idH")
 	}
@@ -778,6 +828,7 @@ func (srv *server) startSession(ss *sshSession) {
 
 // endSession unregisters s from the list of active sessions.
 func (srv *server) endSession(ss *sshSession) {
+	defer srv.sessionWaitGroup.Done()
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	delete(srv.activeSessionByH, ss.idH)
@@ -842,11 +893,23 @@ var recordSSH = envknob.Bool("TS_DEBUG_LOG_SSH")
 // It handles ss once it's been accepted and determined
 // that it should run.
 func (ss *sshSession) run() {
-	srv := ss.conn.srv
-	srv.startSession(ss)
-	defer srv.endSession(ss)
-
+	metricActiveSessions.Add(1)
+	defer metricActiveSessions.Add(-1)
 	defer ss.ctx.CloseWithError(errSessionDone)
+	srv := ss.conn.srv
+
+	srv.mu.Lock()
+	if srv.shutdownCalled {
+		srv.mu.Unlock()
+		// Do not start any new sessions.
+		fmt.Fprintf(ss, "Tailscale SSH is shutting down\r\n")
+		ss.Exit(1)
+		return
+	}
+	srv.startSessionLocked(ss)
+	srv.mu.Unlock()
+
+	defer srv.endSession(ss)
 
 	if ss.action.SessionDuration != 0 {
 		t := time.AfterFunc(ss.action.SessionDuration, func() {
@@ -858,7 +921,7 @@ func (ss *sshSession) run() {
 		defer t.Stop()
 	}
 
-	logf := srv.logf
+	logf := ss.logf
 	lu := ss.conn.localUser
 	localUser := lu.Username
 
@@ -909,15 +972,17 @@ func (ss *sshSession) run() {
 		_, err := io.Copy(rec.writer("i", ss.stdin), ss)
 		if err != nil {
 			// TODO: don't log in the success case.
-			logf("ssh: stdin copy: %v", err)
+			logf("stdin copy: %v", err)
 		}
 		ss.stdin.Close()
 	}()
 	go func() {
 		_, err := io.Copy(rec.writer("o", ss), ss.stdout)
 		if err != nil {
-			// TODO: don't log in the success case.
-			logf("ssh: stdout copy: %v", err)
+			logf("stdout copy: %v", err)
+			// If we got an error here, it's probably because the client has
+			// disconnected.
+			ss.ctx.CloseWithError(err)
 		}
 	}()
 	// stderr is nil for ptys.
@@ -925,8 +990,7 @@ func (ss *sshSession) run() {
 		go func() {
 			_, err := io.Copy(ss.Stderr(), ss.stderr)
 			if err != nil {
-				// TODO: don't log in the success case.
-				logf("ssh: stderr copy: %v", err)
+				logf("stderr copy: %v", err)
 			}
 		}()
 	}
@@ -1289,3 +1353,19 @@ func envEq(a, b string) bool {
 	}
 	return a == b
 }
+
+var (
+	metricActiveSessions       = clientmetric.NewGauge("ssh_active_sessions")
+	metricIncomingConnections  = clientmetric.NewCounter("ssh_incoming_connections")
+	metricPublicKeyConnections = clientmetric.NewCounter("ssh_publickey_connections") // total
+	metricPublicKeyAccepts     = clientmetric.NewCounter("ssh_publickey_accepts")     // accepted subset of ssh_publickey_connections
+	metricTerminalAccept       = clientmetric.NewCounter("ssh_terminalaction_accept")
+	metricTerminalReject       = clientmetric.NewCounter("ssh_terminalaction_reject")
+	metricTerminalInterrupt    = clientmetric.NewCounter("ssh_terminalaction_interrupt")
+	metricTerminalMalformed    = clientmetric.NewCounter("ssh_terminalaction_malformed")
+	metricTerminalFetchError   = clientmetric.NewCounter("ssh_terminalaction_fetch_error")
+	metricHolds                = clientmetric.NewCounter("ssh_holds")
+	metricPolicyChangeKick     = clientmetric.NewCounter("ssh_policy_change_kick")
+	metricSFTP                 = clientmetric.NewCounter("ssh_sftp_requests")
+	metricLocalPortForward     = clientmetric.NewCounter("ssh_local_port_forward_requests")
+)

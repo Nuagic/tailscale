@@ -76,11 +76,12 @@ func TestStdHandler(t *testing.T) {
 	// cancel()
 
 	tests := []struct {
-		name     string
-		rh       ReturnHandler
-		r        *http.Request
-		wantCode int
-		wantLog  AccessLogRecord
+		name       string
+		rh         ReturnHandler
+		r          *http.Request
+		errHandler ErrorHandlerFunc
+		wantCode   int
+		wantLog    AccessLogRecord
 	}{
 		{
 			name:     "handler returns 200",
@@ -238,6 +239,26 @@ func TestStdHandler(t *testing.T) {
 				Code:       101,
 			},
 		},
+		{
+			name:     "error handler gets run",
+			rh:       handlerErr(0, Error(404, "not found", nil)), // status code changed in errHandler
+			r:        req(bgCtx, "http://example.com/"),
+			wantCode: 200,
+			errHandler: func(w http.ResponseWriter, r *http.Request, e HTTPError) {
+				http.Error(w, e.Msg, 200)
+			},
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       404,
+				Err:        "not found",
+				RequestURI: "/",
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -253,7 +274,7 @@ func TestStdHandler(t *testing.T) {
 			clock.Reset()
 
 			rec := noopHijacker{httptest.NewRecorder(), false}
-			h := StdHandler(test.rh, HandlerOptions{Logf: logf, Now: clock.Now})
+			h := StdHandler(test.rh, HandlerOptions{Logf: logf, Now: clock.Now, OnError: test.errHandler})
 			h.ServeHTTP(&rec, test.r)
 			res := rec.Result()
 			if res.StatusCode != test.wantCode {
@@ -578,5 +599,47 @@ func TestAcceptsEncoding(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("%d. got %v; want %v", i, got, tt.want)
 		}
+	}
+}
+
+func TestPort80Handler(t *testing.T) {
+	tests := []struct {
+		name    string
+		h       *Port80Handler
+		req     string
+		wantLoc string
+	}{
+		{
+			name:    "no_fqdn",
+			h:       &Port80Handler{},
+			req:     "GET / HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://foo.com/",
+		},
+		{
+			name:    "fqdn_and_path",
+			h:       &Port80Handler{FQDN: "bar.com"},
+			req:     "GET /path HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://bar.com/path",
+		},
+		{
+			name:    "path_and_query_string",
+			h:       &Port80Handler{FQDN: "baz.com"},
+			req:     "GET /path?a=b HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://baz.com/path?a=b",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.ReadRequest(bufio.NewReader(strings.NewReader(tt.req)))
+			rec := httptest.NewRecorder()
+			tt.h.ServeHTTP(rec, r)
+			got := rec.Result()
+			if got, want := got.StatusCode, 302; got != want {
+				t.Errorf("got status code %v; want %v", got, want)
+			}
+			if got, want := got.Header.Get("Location"), "https://foo.com/"; got != tt.wantLoc {
+				t.Errorf("Location = %q; want %q", got, want)
+			}
+		})
 	}
 }

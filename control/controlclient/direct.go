@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"go4.org/mem"
-	"golang.org/x/sync/singleflight"
 	"inet.af/netaddr"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
@@ -50,6 +49,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
+	"tailscale.com/util/singleflight"
 	"tailscale.com/util/systemd"
 	"tailscale.com/wgengine/monitor"
 )
@@ -77,7 +77,7 @@ type Direct struct {
 	serverKey      key.MachinePublic // original ("legacy") nacl crypto_box-based public key
 	serverNoiseKey key.MachinePublic
 
-	sfGroup     singleflight.Group // protects noiseClient creation.
+	sfGroup     singleflight.Group[struct{}, *noiseClient] // protects noiseClient creation.
 	noiseClient *noiseClient
 
 	persist       persist.Persist
@@ -88,7 +88,6 @@ type Direct struct {
 	netinfo       *tailcfg.NetInfo
 	endpoints     []tailcfg.Endpoint
 	everEndpoints bool   // whether we've ever had non-empty endpoints
-	localPort     uint16 // or zero to mean auto
 	lastPingURL   string // last PingRequest.URL received, for dup suppression
 }
 
@@ -109,6 +108,9 @@ type Options struct {
 	PopBrowserURL        func(url string) // optional func to open browser
 	Dialer               *tsdial.Dialer   // non-nil
 
+	// Status is called when there's a change in status.
+	Status func(Status)
+
 	// KeepSharerAndUserSplit controls whether the client
 	// understands Node.Sharer. If false, the Sharer is mapped to the User.
 	KeepSharerAndUserSplit bool
@@ -124,11 +126,10 @@ type Options struct {
 	Pinger Pinger
 }
 
-// Pinger is a subset of the wgengine.Engine interface, containing just the Ping method.
+// Pinger is the LocalBackend.Ping method.
 type Pinger interface {
-	// Ping is a request to start a ping with the peer handling the given IP and
-	// then call cb with its ping latency & method.
-	Ping(ip netaddr.IP, pingType tailcfg.PingType, cb func(*ipnstate.PingResult))
+	// Ping is a request to do a ping with the peer handling the given IP.
+	Ping(ctx context.Context, ip netaddr.IP, pingType tailcfg.PingType) (*ipnstate.PingResult, error)
 }
 
 type Decompressor interface {
@@ -587,20 +588,19 @@ func sameEndpoints(a, b []tailcfg.Endpoint) bool {
 // whether they've changed.
 //
 // It does not retain the provided slice.
-func (c *Direct) newEndpoints(localPort uint16, endpoints []tailcfg.Endpoint) (changed bool) {
+func (c *Direct) newEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// Nothing new?
-	if c.localPort == localPort && sameEndpoints(c.endpoints, endpoints) {
+	if sameEndpoints(c.endpoints, endpoints) {
 		return false // unchanged
 	}
 	var epStrs []string
 	for _, ep := range endpoints {
 		epStrs = append(epStrs, ep.Addr.String())
 	}
-	c.logf("[v2] client.newEndpoints(%v, %v)", localPort, epStrs)
-	c.localPort = localPort
+	c.logf("[v2] client.newEndpoints(%v)", epStrs)
 	c.endpoints = append(c.endpoints[:0], endpoints...)
 	if len(endpoints) > 0 {
 		c.everEndpoints = true
@@ -611,28 +611,37 @@ func (c *Direct) newEndpoints(localPort uint16, endpoints []tailcfg.Endpoint) (c
 // SetEndpoints updates the list of locally advertised endpoints.
 // It won't be replicated to the server until a *fresh* call to PollNetMap().
 // You don't need to restart PollNetMap if we return changed==false.
-func (c *Direct) SetEndpoints(localPort uint16, endpoints []tailcfg.Endpoint) (changed bool) {
+func (c *Direct) SetEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 	// (no log message on function entry, because it clutters the logs
 	//  if endpoints haven't changed. newEndpoints() will log it.)
-	return c.newEndpoints(localPort, endpoints)
+	return c.newEndpoints(endpoints)
 }
 
 func inTest() bool { return flag.Lookup("test.v") != nil }
 
 // PollNetMap makes a /map request to download the network map, calling cb with
 // each new netmap.
-//
-// maxPolls is how many network maps to download; common values are 1
-// or -1 (to keep a long-poll query open to the server).
-func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*netmap.NetworkMap)) error {
-	return c.sendMapRequest(ctx, maxPolls, cb)
+func (c *Direct) PollNetMap(ctx context.Context, cb func(*netmap.NetworkMap)) error {
+	return c.sendMapRequest(ctx, -1, false, cb)
+}
+
+// FetchNetMap fetches the netmap once.
+func (c *Direct) FetchNetMap(ctx context.Context) (*netmap.NetworkMap, error) {
+	var ret *netmap.NetworkMap
+	err := c.sendMapRequest(ctx, 1, false, func(nm *netmap.NetworkMap) {
+		ret = nm
+	})
+	if err == nil && ret == nil {
+		return nil, errors.New("[unexpected] sendMapRequest success without callback")
+	}
+	return ret, err
 }
 
 // SendLiteMapUpdate makes a /map request to update the server of our latest state,
 // but does not fetch anything. It returns an error if the server did not return a
 // successful 200 OK response.
 func (c *Direct) SendLiteMapUpdate(ctx context.Context) error {
-	return c.sendMapRequest(ctx, 1, nil)
+	return c.sendMapRequest(ctx, 1, false, nil)
 }
 
 // If we go more than pollTimeout without hearing from the server,
@@ -641,7 +650,7 @@ func (c *Direct) SendLiteMapUpdate(ctx context.Context) error {
 const pollTimeout = 120 * time.Second
 
 // cb nil means to omit peers.
-func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netmap.NetworkMap)) error {
+func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, readOnly bool, cb func(*netmap.NetworkMap)) error {
 	metricMapRequests.Add(1)
 	metricMapRequestsActive.Add(1)
 	defer metricMapRequestsActive.Add(-1)
@@ -658,7 +667,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	serverNoiseKey := c.serverNoiseKey
 	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
-	localPort := c.localPort
 	var epStrs []string
 	var epTypes []tailcfg.EndpointType
 	for _, ep := range c.endpoints {
@@ -684,7 +692,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	}
 
 	allowStream := maxPolls != 1
-	c.logf("[v1] PollNetMap: stream=%v :%v ep=%v", allowStream, localPort, epStrs)
+	c.logf("[v1] PollNetMap: stream=%v ep=%v", allowStream, epStrs)
 
 	vlogf := logger.Discard
 	if Debug.NetMap {
@@ -704,6 +712,16 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		Hostinfo:      hi,
 		DebugFlags:    c.debugFlags,
 		OmitPeers:     cb == nil,
+
+		// On initial startup before we know our endpoints, set the ReadOnly flag
+		// to tell the control server not to distribute out our (empty) endpoints to peers.
+		// Presumably we'll learn our endpoints in a half second and do another post
+		// with useful results. The first POST just gets us the DERP map which we
+		// need to do the STUN queries to discover our endpoints.
+		// TODO(bradfitz): we skip this optimization in tests, though,
+		// because the e2e tests are currently hyperspecific about the
+		// ordering of things. The e2e tests need love.
+		ReadOnly: readOnly || (len(epStrs) == 0 && !everEndpoints && !inTest()),
 	}
 	var extraDebugFlags []string
 	if hi != nil && c.linkMon != nil && !c.skipIPForwardingCheck &&
@@ -725,17 +743,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	}
 	if c.newDecompressor != nil {
 		request.Compress = "zstd"
-	}
-	// On initial startup before we know our endpoints, set the ReadOnly flag
-	// to tell the control server not to distribute out our (empty) endpoints to peers.
-	// Presumably we'll learn our endpoints in a half second and do another post
-	// with useful results. The first POST just gets us the DERP map which we
-	// need to do the STUN queries to discover our endpoints.
-	// TODO(bradfitz): we skip this optimization in tests, though,
-	// because the e2e tests are currently hyperspecific about the
-	// ordering of things. The e2e tests need love.
-	if len(epStrs) == 0 && !everEndpoints && !inTest() {
-		request.ReadOnly = true
 	}
 
 	bodyData, err := encode(request, serverKey, serverNoiseKey, machinePrivKey)
@@ -940,14 +947,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		if Debug.StripCaps {
 			nm.SelfNode.Capabilities = nil
 		}
-
-		// Get latest localPort. This might've changed if
-		// a lite map update occurred meanwhile. This only affects
-		// the end-to-end test.
-		// TODO(bradfitz): remove the NetworkMap.LocalPort field entirely.
-		c.mu.Lock()
-		nm.LocalPort = c.localPort
-		c.mu.Unlock()
 
 		// Occasionally print the netmap header.
 		// This is handy for debugging, and our logs processing
@@ -1208,10 +1207,8 @@ func answerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinge
 	}
 	for _, t := range strings.Split(pr.Types, ",") {
 		switch pt := tailcfg.PingType(t); pt {
-		case tailcfg.PingTSMP, tailcfg.PingDisco, tailcfg.PingICMP:
+		case tailcfg.PingTSMP, tailcfg.PingDisco, tailcfg.PingICMP, tailcfg.PingPeerAPI:
 			go doPingerPing(logf, c, pr, pinger, pt)
-		// TODO(tailscale/corp#754)
-		// case "peerapi":
 		default:
 			logf("unsupported ping request type: %q", t)
 		}
@@ -1283,13 +1280,12 @@ func (c *Direct) getNoiseClient() (*noiseClient, error) {
 	if nc != nil {
 		return nc, nil
 	}
-	np, err, _ := c.sfGroup.Do("noise", func() (any, error) {
+	nc, err, _ := c.sfGroup.Do(struct{}{}, func() (*noiseClient, error) {
 		k, err := c.getMachinePrivKey()
 		if err != nil {
 			return nil, err
 		}
-
-		nc, err = newNoiseClient(k, serverNoiseKey, c.serverURL, c.dialer)
+		nc, err := newNoiseClient(k, serverNoiseKey, c.serverURL, c.dialer)
 		if err != nil {
 			return nil, err
 		}
@@ -1301,7 +1297,7 @@ func (c *Direct) getNoiseClient() (*noiseClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return np.(*noiseClient), nil
+	return nc, nil
 }
 
 // setDNSNoise sends the SetDNSRequest request to the control plane server over Noise,
@@ -1417,10 +1413,17 @@ func doPingerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pin
 		return
 	}
 	start := time.Now()
-	pinger.Ping(pr.IP, pingType, func(res *ipnstate.PingResult) {
-		// Currently does not check for error since we just return if it fails.
-		postPingResult(start, logf, c, pr, res.ToPingResponse(pingType))
-	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := pinger.Ping(ctx, pr.IP, pingType)
+	if err != nil {
+		d := time.Since(start).Round(time.Millisecond)
+		logf("doPingerPing: ping error of type %q to %v after %v: %v", pingType, pr.IP, d, err)
+		return
+	}
+	postPingResult(start, logf, c, pr, res.ToPingResponse(pingType))
 }
 
 func postPingResult(start time.Time, logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, res *tailcfg.PingResponse) error {

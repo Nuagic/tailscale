@@ -13,8 +13,8 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"tailscale.com/util/lineread"
 	"tailscale.com/version/distro"
 )
@@ -37,6 +37,7 @@ func linuxDeviceModel() string {
 		// Otherwise, try the Devicetree model, usually set on
 		// ARM SBCs, etc.
 		// Example: "Raspberry Pi 4 Model B Rev 1.2"
+		// Example: "WD My Cloud Gen2: Marvell Armada 375"
 		"/sys/firmware/devicetree/base/model", // Raspberry Pi 4 Model B Rev 1.2"
 	} {
 		b, _ := os.ReadFile(path)
@@ -55,6 +56,9 @@ func osVersionLinux() string {
 		propFile = "/etc.defaults/VERSION"
 	case distro.OpenWrt:
 		propFile = "/etc/openwrt_release"
+	case distro.WDMyCloud:
+		slurp, _ := ioutil.ReadFile("/etc/version")
+		return fmt.Sprintf("%s", string(bytes.TrimSpace(slurp)))
 	}
 
 	m := map[string]string{}
@@ -68,17 +72,12 @@ func osVersionLinux() string {
 		return nil
 	})
 
-	var un syscall.Utsname
-	syscall.Uname(&un)
+	var un unix.Utsname
+	unix.Uname(&un)
 
 	var attrBuf strings.Builder
 	attrBuf.WriteString("; kernel=")
-	for _, b := range un.Release {
-		if b == 0 {
-			break
-		}
-		attrBuf.WriteByte(byte(b))
-	}
+	attrBuf.WriteString(unix.ByteSliceToString(un.Release[:]))
 	if inContainer() {
 		attrBuf.WriteString("; container")
 	}

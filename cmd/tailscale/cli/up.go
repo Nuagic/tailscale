@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -114,6 +115,8 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	case "windows":
 		upf.BoolVar(&upArgs.forceDaemon, "unattended", false, "run in \"Unattended Mode\" where Tailscale keeps running even after the current GUI user logs out (Windows-only)")
 	}
+	upf.DurationVar(&upArgs.timeout, "timeout", 0, "maximum amount of time to wait for tailscaled to enter a Running state; default (0s) blocks forever")
+	registerAcceptRiskFlag(upf)
 	return upf
 }
 
@@ -146,6 +149,7 @@ type upArgsT struct {
 	hostname               string
 	opUser                 string
 	json                   bool
+	timeout                time.Duration
 }
 
 func (a upArgsT) getAuthKey() (string, error) {
@@ -400,7 +404,7 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	return simpleUp, justEditMP, nil
 }
 
-func runUp(ctx context.Context, args []string) error {
+func runUp(ctx context.Context, args []string) (retErr error) {
 	if len(args) > 0 {
 		fatalf("too many non-flag arguments: %q", args)
 	}
@@ -465,6 +469,24 @@ func runUp(ctx context.Context, args []string) error {
 		backendState:  st.BackendState,
 		curExitNodeIP: exitNodeIP(curPrefs, st),
 	}
+
+	if upArgs.runSSH != curPrefs.RunSSH && isSSHOverTailscale() {
+		if upArgs.runSSH {
+			err = presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will reroute SSH traffic to Tailscale SSH and will result in your session disconnecting.`)
+		} else {
+			err = presentRiskToUser(riskLoseSSH, `You are connected using Tailscale SSH; this action will result in your session disconnecting.`)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	defer func() {
+		if retErr == nil {
+			checkSSHUpWarnings(ctx)
+		}
+	}()
+
 	simpleUp, justEditMP, err := updatePrefs(prefs, curPrefs, env)
 	if err != nil {
 		fatalf("%s", err)
@@ -632,6 +654,12 @@ func runUp(ctx context.Context, args []string) error {
 	// need to prioritize reads from 'running' if it's
 	// readable; its send does happen before the pump mechanism
 	// shuts down. (Issue 2333)
+	var timeoutCh <-chan time.Time
+	if upArgs.timeout > 0 {
+		timeoutTimer := time.NewTimer(upArgs.timeout)
+		defer timeoutTimer.Stop()
+		timeoutCh = timeoutTimer.C
+	}
 	select {
 	case <-running:
 		return nil
@@ -649,6 +677,30 @@ func runUp(ctx context.Context, args []string) error {
 		default:
 		}
 		return err
+	case <-timeoutCh:
+		return errors.New(`timeout waiting for Tailscale service to enter a Running state; check health with "tailscale status"`)
+	}
+}
+
+func checkSSHUpWarnings(ctx context.Context) {
+	if !upArgs.runSSH {
+		return
+	}
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		// Ignore. Don't spam more.
+		return
+	}
+	if len(st.Health) == 0 {
+		return
+	}
+	if len(st.Health) == 1 && strings.Contains(st.Health[0], "SSH") {
+		printf("%s\n", st.Health[0])
+		return
+	}
+	printf("# Health check:\n")
+	for _, m := range st.Health {
+		printf("    - %s\n", m)
 	}
 }
 
@@ -705,7 +757,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "json":
+	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout", "accept-risk":
 		return true
 	}
 	return false

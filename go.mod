@@ -27,7 +27,7 @@ require (
 	github.com/insomniacslk/dhcp v0.0.0-20211209223715-7d93572ebe8e
 	github.com/jsimonetti/rtnetlink v1.1.2-0.20220408201609-d380b505068b
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/klauspost/compress v1.13.6
+	github.com/klauspost/compress v1.15.4
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a
 	github.com/mdlayher/genetlink v1.2.0
 	github.com/mdlayher/netlink v1.6.0
@@ -43,6 +43,7 @@ require (
 	github.com/tailscale/golang-x-crypto v0.0.0-20220428210705-0b941c09a5e1
 	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05
 	github.com/tailscale/hujson v0.0.0-20220506202205-92b4b88a9e17
+	github.com/tailscale/mkctr v0.0.0-20220601142259-c0b937af2e89
 	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/tcnksm/go-httpstat v0.2.0
 	github.com/toqueteos/webbrowser v1.2.0
@@ -50,9 +51,9 @@ require (
 	github.com/vishvananda/netlink v1.1.1-0.20211118161826-650dca95af54
 	go4.org/mem v0.0.0-20210711025021-927187094b94
 	golang.org/x/crypto v0.0.0-20220427172511-eb4f295cb31f
-	golang.org/x/net v0.0.0-20220407224826-aac1ed45d8e3
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220503163025-988cb79eb6c6
+	golang.org/x/net v0.0.0-20220516155154-20f960328961
+	golang.org/x/sync v0.0.0-20220513210516-0976fa681c29
+	golang.org/x/sys v0.0.0-20220513210249-45d2b4557a2a
 	golang.org/x/term v0.0.0-20210927222741-03fcf44c2211
 	golang.org/x/time v0.0.0-20211116232009-f0f3c7e86c11
 	golang.org/x/tools v0.1.11-0.20220413170336-afc6aad76eb1
@@ -60,7 +61,7 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.4.10
 	gvisor.dev/gvisor v0.0.0-20220407223209-21871174d445
 	honnef.co/go/tools v0.4.0-0.dev.0.20220404092545-59d7a2877f83
-	inet.af/netaddr v0.0.0-20211027220019-c74959edd3b6
+	inet.af/netaddr v0.0.0-20220617031823-097006376321
 	inet.af/peercred v0.0.0-20210906144145-0893ea02156a
 	inet.af/wf v0.0.0-20211204062712-86aaea0a7310
 	nhooyr.io/websocket v1.8.7
@@ -76,7 +77,7 @@ require (
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/Masterminds/semver/v3 v3.1.1 // indirect
 	github.com/Masterminds/sprig v2.22.0+incompatible // indirect
-	github.com/Microsoft/go-winio v0.5.1 // indirect
+	github.com/Microsoft/go-winio v0.5.2 // indirect
 	github.com/OpenPeeDeeP/depguard v1.0.1 // indirect
 	github.com/ProtonMail/go-crypto v0.0.0-20211112122917-428f8eabeeb3 // indirect
 	github.com/acomagu/bufpipe v1.0.3 // indirect
@@ -106,9 +107,14 @@ require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
 	github.com/charithe/durationcheck v0.0.9 // indirect
 	github.com/chavacava/garif v0.0.0-20210405164556-e8a0a408d6af // indirect
+	github.com/containerd/stargz-snapshotter/estargz v0.11.4 // indirect
 	github.com/daixiang0/gci v0.2.9 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/denis-tingajkin/go-header v0.4.2 // indirect
+	github.com/docker/cli v20.10.16+incompatible // indirect
+	github.com/docker/distribution v2.8.1+incompatible // indirect
+	github.com/docker/docker v20.10.16+incompatible // indirect
+	github.com/docker/docker-credential-helpers v0.6.4 // indirect
 	github.com/emirpasic/gods v1.12.0 // indirect
 	github.com/esimonov/ifshort v1.0.3 // indirect
 	github.com/ettle/strcase v0.1.1 // indirect
@@ -143,6 +149,7 @@ require (
 	github.com/golangci/revgrep v0.0.0-20210930125155-c22e5001d4f2 // indirect
 	github.com/golangci/unconvert v0.0.0-20180507085042-28b1c447d1f4 // indirect
 	github.com/google/btree v1.0.1 // indirect
+	github.com/google/go-containerregistry v0.9.0 // indirect
 	github.com/google/goterm v0.0.0-20200907032337-555d40f16ae2 // indirect
 	github.com/google/rpmpack v0.0.0-20201206194719-59e495f2b7e1 // indirect
 	github.com/gordonklaus/ineffassign v0.0.0-20210914165742-4cc7213b9bc8 // indirect
@@ -198,6 +205,8 @@ require (
 	github.com/nishanths/predeclared v0.2.1 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
+	github.com/opencontainers/image-spec v1.0.3-0.20220114050600-8b9d41f48198 // indirect
 	github.com/pelletier/go-toml v1.9.4 // indirect
 	github.com/phayes/checkstyle v0.0.0-20170904204023-bfd46e6a821d // indirect
 	github.com/pkg/diff v0.0.0-20210226163009-20ebb0f2a09e // indirect
@@ -225,7 +234,7 @@ require (
 	github.com/sourcegraph/go-diff v0.6.1 // indirect
 	github.com/spf13/afero v1.6.0 // indirect
 	github.com/spf13/cast v1.4.1 // indirect
-	github.com/spf13/cobra v1.2.1 // indirect
+	github.com/spf13/cobra v1.4.0 // indirect
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/spf13/viper v1.9.0 // indirect
@@ -244,17 +253,18 @@ require (
 	github.com/ultraware/funlen v0.0.3 // indirect
 	github.com/ultraware/whitespace v0.0.4 // indirect
 	github.com/uudashr/gocognit v1.0.5 // indirect
+	github.com/vbatts/tar-split v0.11.2 // indirect
 	github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74 // indirect
 	github.com/xanzy/ssh-agent v0.3.1 // indirect
 	github.com/yeya24/promlinter v0.1.0 // indirect
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
-	go4.org/unsafe/assume-no-moving-gc v0.0.0-20211027215541-db492cf91b37 // indirect
+	go4.org/unsafe/assume-no-moving-gc v0.0.0-20220617031537-928513b29760 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20220328175248-053ad81199eb // indirect
 	golang.org/x/mod v0.6.0-dev.0.20220106191415-9b9b3d81d5e3 // indirect
 	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/xerrors v0.0.0-20220411194840-2f41105eb62f // indirect
 	golang.zx2c4.com/wintun v0.0.0-20211104114900-415007cec224 // indirect
-	google.golang.org/protobuf v1.27.1 // indirect
+	google.golang.org/protobuf v1.28.0 // indirect
 	gopkg.in/ini.v1 v1.66.2 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

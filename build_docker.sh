@@ -32,7 +32,7 @@ REPOS="${REPOS:-${DEFAULT_REPOS}}"
 TAGS="${TAGS:-${DEFAULT_TAGS}}"
 BASE="${BASE:-${DEFAULT_BASE}}"
 
-go run github.com/tailscale/mkctr@latest \
+go run github.com/tailscale/mkctr \
   --gopaths="\
     tailscale.com/cmd/tailscale:/usr/local/bin/tailscale, \
     tailscale.com/cmd/tailscaled:/usr/local/bin/tailscaled" \
@@ -40,7 +40,9 @@ go run github.com/tailscale/mkctr@latest \
     -X tailscale.com/version.Long=${VERSION_LONG} \
     -X tailscale.com/version.Short=${VERSION_SHORT} \
     -X tailscale.com/version.GitCommit=${VERSION_GIT_HASH}" \
+  --files="docs/k8s/run.sh:/tailscale/run.sh" \
   --base="${BASE}" \
   --tags="${TAGS}" \
   --repos="${REPOS}" \
-  --push="${PUSH}"
+  --push="${PUSH}" \
+  /bin/sh /tailscale/run.sh
