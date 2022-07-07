@@ -16,6 +16,7 @@ import (
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 )
 
@@ -42,6 +43,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 		name    string
 		nm      *netmap.NetworkMap
 		os      string // version.OS value; empty means linux
+		cloud   cloudenv.Cloud
 		prefs   *ipn.Prefs
 		want    *dns.Config
 		wantLog string

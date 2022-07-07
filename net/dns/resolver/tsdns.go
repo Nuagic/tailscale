@@ -31,6 +31,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/monitor"
 )
@@ -96,6 +97,9 @@ func (c *Config) WriteToBufioWriter(w *bufio.Writer) {
 	w.WriteString("]")
 	if arpa > 0 {
 		fmt.Fprintf(w, "+%darpa", arpa)
+	}
+	if c := cloudenv.Get(); c != "" {
+		fmt.Fprintf(w, ", cloud=%q", string(c))
 	}
 	w.WriteString("}")
 }
@@ -278,7 +282,15 @@ func (r *Resolver) Query(ctx context.Context, bs []byte, from netaddr.IPPort) ([
 		defer cancel()
 		err = r.forwarder.forwardWithDestChan(ctx, packet{bs, from}, responses)
 		if err != nil {
-			return nil, err
+			select {
+			// Best effort: use any error response sent by forwardWithDestChan.
+			// This is present in some errors paths, such as when all upstream
+			// DNS servers replied with an error.
+			case resp := <-responses:
+				return resp.bs, err
+			default:
+				return nil, err
+			}
 		}
 		return (<-responses).bs, nil
 	}
