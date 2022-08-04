@@ -16,6 +16,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"reflect"
@@ -26,7 +27,6 @@ import (
 	"time"
 
 	"go4.org/mem"
-	"inet.af/netaddr"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -67,6 +67,7 @@ type Direct struct {
 	linkMon                *monitor.Mon // or nil
 	discoPubKey            key.DiscoPublic
 	getMachinePrivKey      func() (key.MachinePrivate, error)
+	getNLPublicKey         func() (key.NLPublic, error) // or nil
 	debugFlags             []string
 	keepSharerAndUserSplit bool
 	skipIPForwardingCheck  bool
@@ -108,6 +109,10 @@ type Options struct {
 	PopBrowserURL        func(url string) // optional func to open browser
 	Dialer               *tsdial.Dialer   // non-nil
 
+	// GetNLPublicKey specifies an optional function to use
+	// Network Lock. If nil, it's not used.
+	GetNLPublicKey func() (key.NLPublic, error)
+
 	// Status is called when there's a change in status.
 	Status func(Status)
 
@@ -129,7 +134,7 @@ type Options struct {
 // Pinger is the LocalBackend.Ping method.
 type Pinger interface {
 	// Ping is a request to do a ping with the peer handling the given IP.
-	Ping(ctx context.Context, ip netaddr.IP, pingType tailcfg.PingType) (*ipnstate.PingResult, error)
+	Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType) (*ipnstate.PingResult, error)
 }
 
 type Decompressor interface {
@@ -190,6 +195,7 @@ func NewDirect(opts Options) (*Direct, error) {
 	c := &Direct{
 		httpc:                  httpc,
 		getMachinePrivKey:      opts.GetMachinePrivateKey,
+		getNLPublicKey:         opts.GetNLPublicKey,
 		serverURL:              opts.ServerURL,
 		timeNow:                opts.TimeNow,
 		logf:                   opts.Logf,
@@ -424,6 +430,14 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		oldNodeKey = persist.OldPrivateNodeKey.Public()
 	}
 
+	var nlPub key.NLPublic
+	if c.getNLPublicKey != nil {
+		nlPub, err = c.getNLPublicKey()
+		if err != nil {
+			return false, "", fmt.Errorf("get nl key: %v", err)
+		}
+	}
+
 	if tryingNewKey.IsZero() {
 		if opt.Logout {
 			return false, "", errors.New("no nodekey to log out")
@@ -439,6 +453,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		Version:    1,
 		OldNodeKey: oldNodeKey,
 		NodeKey:    tryingNewKey.Public(),
+		NLKey:      nlPub,
 		Hostinfo:   hi,
 		Followup:   opt.URL,
 		Timestamp:  &now,
@@ -1136,8 +1151,8 @@ var clockNow = time.Now
 
 // opt.Bool configs from control.
 var (
-	controlUseDERPRoute atomic.Value
-	controlTrimWGConfig atomic.Value
+	controlUseDERPRoute atomic.Value // of opt.Bool
+	controlTrimWGConfig atomic.Value // of opt.Bool
 )
 
 func setControlAtomic(dst *atomic.Value, v opt.Bool) {
@@ -1167,8 +1182,8 @@ func TrimWGConfig() opt.Bool {
 // It should not return false positives.
 //
 // TODO(bradfitz): Change controlclient.Options.SkipIPForwardingCheck into a
-// func([]netaddr.IPPrefix) error signature instead.
-func ipForwardingBroken(routes []netaddr.IPPrefix, state *interfaces.State) bool {
+// func([]netip.Prefix) error signature instead.
+func ipForwardingBroken(routes []netip.Prefix, state *interfaces.State) bool {
 	warn, err := netutil.CheckIPForwarding(routes, state)
 	if err != nil {
 		// Oh well, we tried. This is just for debugging.
@@ -1408,7 +1423,7 @@ func (c *Direct) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 // doPingerPing sends a Ping to pr.IP using pinger, and sends an http request back to
 // pr.URL with ping response data.
 func doPingerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinger Pinger, pingType tailcfg.PingType) {
-	if pr.URL == "" || pr.IP.IsZero() || pinger == nil {
+	if pr.URL == "" || !pr.IP.IsValid() || pinger == nil {
 		logf("invalid ping request: missing url, ip or pinger")
 		return
 	}

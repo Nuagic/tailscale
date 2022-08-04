@@ -76,20 +76,20 @@ func (k AUMKind) String() string {
 // AUM describes an Authority Update Message.
 //
 // The rules for adding new types of AUMs (MessageKind):
-// - CBOR key IDs must never be changed.
-// - New AUM types must not change semantics that are manipulated by other
-//   AUM types.
-// - The serialization of existing data cannot change (in other words, if
-//   an existing serialization test in aum_test.go fails, you need to try a
-//   different approach).
+//   - CBOR key IDs must never be changed.
+//   - New AUM types must not change semantics that are manipulated by other
+//     AUM types.
+//   - The serialization of existing data cannot change (in other words, if
+//     an existing serialization test in aum_test.go fails, you need to try a
+//     different approach).
 //
 // The rules for adding new fields are as follows:
-// - Must all be optional.
-// - An unset value must not result in serialization overhead. This is
-//   necessary so the serialization of older AUMs stays the same.
-// - New processing semantics of the new fields must be compatible with the
-//   behavior of old clients (which will ignore the field).
-// - No floats!
+//   - Must all be optional.
+//   - An unset value must not result in serialization overhead. This is
+//     necessary so the serialization of older AUMs stays the same.
+//   - New processing semantics of the new fields must be compatible with the
+//     behavior of old clients (which will ignore the field).
+//   - No floats!
 type AUM struct {
 	MessageKind AUMKind `cbor:"1,keyasint"`
 	PrevAUMHash []byte  `cbor:"2,keyasint"`
@@ -104,8 +104,7 @@ type AUM struct {
 
 	// State describes the full state of the key authority.
 	// This field is used for Checkpoint AUMs.
-	// TODO(tom): Use type *State once a future PR brings in that type.
-	State interface{} `cbor:"5,keyasint,omitempty"`
+	State *State `cbor:"5,keyasint,omitempty"`
 
 	// DisablementSecret is used to transmit a secret for disabling
 	// the TKA.
@@ -138,7 +137,11 @@ func (a *AUM) StaticValidate() error {
 		}
 	}
 
-	// TODO(tom): Validate State once a future PR brings in that type.
+	if a.State != nil {
+		if err := a.State.staticValidateCheckpoint(); err != nil {
+			return fmt.Errorf("checkpoint state: %v", err)
+		}
+	}
 
 	switch a.MessageKind {
 	case AUMAddKey:
@@ -177,7 +180,7 @@ func (a *AUM) StaticValidate() error {
 			return errors.New("DisableNL AUMs must specify a disablement secret")
 		}
 		if a.KeyID != nil || a.State != nil || a.Key != nil || a.Votes != nil || a.Meta != nil {
-			return errors.New("DisableNL AUMs may only a disablement secret")
+			return errors.New("DisableNL AUMs may only specify a disablement secret")
 		}
 	}
 
@@ -253,4 +256,49 @@ func (a *AUM) sign25519(priv ed25519.PrivateKey) {
 	})
 }
 
-// TODO(tom): Implement Weight() once a future PR brings in the State type.
+// Weight computes the 'signature weight' of the AUM
+// based on keys in the state machine. The caller must
+// ensure that all signatures are valid.
+//
+// More formally: W = Sum(key.votes)
+//
+// AUMs with a higher weight than their siblings
+// are preferred when resolving forks in the AUM chain.
+func (a *AUM) Weight(state State) uint {
+	var weight uint
+
+	// Track the keys that have already been used, so two
+	// signatures with the same key do not result in 2x
+	// the weight.
+	//
+	// Despite the wire encoding being []byte, all KeyIDs are
+	// 32 bytes. As such, we use that as the key for the map,
+	// because map keys cannot be slices.
+	seenKeys := make(map[[32]byte]struct{}, 6)
+	for _, sig := range a.Signatures {
+		if len(sig.KeyID) != 32 {
+			panic("unexpected: keyIDs are 32 bytes")
+		}
+
+		var keyID [32]byte
+		copy(keyID[:], sig.KeyID)
+
+		key, err := state.GetKey(sig.KeyID)
+		if err != nil {
+			if err == ErrNoSuchKey {
+				// Signatures with an unknown key do not contribute
+				// to the weight.
+				continue
+			}
+			panic(err)
+		}
+		if _, seen := seenKeys[keyID]; seen {
+			continue
+		}
+
+		weight += key.Votes
+		seenKeys[keyID] = struct{}{}
+	}
+
+	return weight
+}
