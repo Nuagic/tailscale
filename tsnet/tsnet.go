@@ -10,6 +10,7 @@ package tsnet
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -91,6 +92,7 @@ type Server struct {
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
 	localClient      *tailscale.LocalClient
+	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
 
 	mu        sync.Mutex
@@ -138,6 +140,7 @@ func (s *Server) Close() error {
 		defer wg.Done()
 		// Perform a best-effort final flush.
 		s.logtail.Shutdown(ctx)
+		s.logbuffer.Close()
 	}()
 
 	if _, isMemStore := s.Store.(*mem.Store); isMemStore && s.Ephemeral {
@@ -180,7 +183,10 @@ func (s *Server) getAuthKey() string {
 	return os.Getenv("TS_AUTHKEY")
 }
 
-func (s *Server) start() error {
+func (s *Server) start() (reterr error) {
+	var closePool closeOnErrorPool
+	defer closePool.closeAllIfError(&reterr)
+
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -238,15 +244,16 @@ func (s *Server) start() error {
 	}
 	logid := lpc.PublicID.String()
 
-	f, err := filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
+	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
 	if err != nil {
 		return fmt.Errorf("error creating filch: %w", err)
 	}
+	closePool.add(s.logbuffer)
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
 		Stderr:     ioutil.Discard, // log everything to Buffer
-		Buffer:     f,
+		Buffer:     s.logbuffer,
 		NewZstdEncoder: func() logtail.Encoder {
 			w, err := smallzstd.NewEncoder(nil)
 			if err != nil {
@@ -257,11 +264,13 @@ func (s *Server) start() error {
 		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
 	}
 	s.logtail = logtail.NewLogger(c, logf)
+	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
 
 	s.linkMon, err = monitor.New(logf)
 	if err != nil {
 		return err
 	}
+	closePool.add(s.linkMon)
 
 	s.dialer = new(tsdial.Dialer) // mutated below (before used)
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
@@ -272,6 +281,7 @@ func (s *Server) start() error {
 	if err != nil {
 		return err
 	}
+	closePool.add(s.dialer)
 
 	tunDev, magicConn, dns, ok := eng.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
@@ -315,6 +325,7 @@ func (s *Server) start() error {
 	lb.SetVarRoot(s.rootPath)
 	logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
+	closePool.addFunc(func() { s.lb.Shutdown() })
 	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
 		return smallzstd.NewDecoder(nil)
 	})
@@ -355,7 +366,20 @@ func (s *Server) start() error {
 			logf("localapi serve error: %v", err)
 		}
 	}()
+	closePool.add(s.localAPIListener)
 	return nil
+}
+
+type closeOnErrorPool []func()
+
+func (p *closeOnErrorPool) add(c io.Closer)   { *p = append(*p, func() { c.Close() }) }
+func (p *closeOnErrorPool) addFunc(fn func()) { *p = append(*p, fn) }
+func (p closeOnErrorPool) closeAllIfError(errp *error) {
+	if *errp != nil {
+		for _, closeFn := range p {
+			closeFn()
+		}
+	}
 }
 
 func (s *Server) logf(format string, a ...interface{}) {

@@ -127,11 +127,11 @@ type LocalBackend struct {
 	serverURL             string           // tailcontrol URL
 	newDecompressor       func() (controlclient.Decompressor, error)
 	varRoot               string // or empty if SetVarRoot never called
-	sshAtomicBool         syncs.AtomicBool
+	sshAtomicBool         atomic.Bool
 	shutdownCalled        bool // if Shutdown has been called
 
 	filterAtomic            atomic.Pointer[filter.Filter]
-	containsViaIPFuncAtomic atomic.Value // of func(netip.Addr) bool
+	containsViaIPFuncAtomic syncs.AtomicValue[func(netip.Addr) bool]
 
 	// The mutex protects the following elements.
 	mu             sync.Mutex
@@ -1501,17 +1501,17 @@ func (b *LocalBackend) tellClientToBrowseToURL(url string) {
 var panicOnMachineKeyGeneration = envknob.Bool("TS_DEBUG_PANIC_MACHINE_KEY")
 
 func (b *LocalBackend) createGetMachinePrivateKeyFunc() func() (key.MachinePrivate, error) {
-	var cache atomic.Value
+	var cache syncs.AtomicValue[key.MachinePrivate]
 	return func() (key.MachinePrivate, error) {
 		if panicOnMachineKeyGeneration {
 			panic("machine key generated")
 		}
-		if v, ok := cache.Load().(key.MachinePrivate); ok {
+		if v, ok := cache.LoadOk(); ok {
 			return v, nil
 		}
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if v, ok := cache.Load().(key.MachinePrivate); ok {
+		if v, ok := cache.LoadOk(); ok {
 			return v, nil
 		}
 		if err := b.initMachineKeyLocked(); err != nil {
@@ -1523,11 +1523,11 @@ func (b *LocalBackend) createGetMachinePrivateKeyFunc() func() (key.MachinePriva
 }
 
 func (b *LocalBackend) createGetNLPublicKeyFunc() func() (key.NLPublic, error) {
-	var cache atomic.Value
+	var cache syncs.AtomicValue[key.NLPublic]
 	return func() (key.NLPublic, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if v, ok := cache.Load().(key.NLPublic); ok {
+		if v, ok := cache.LoadOk(); ok {
 			return v, nil
 		}
 
@@ -1740,7 +1740,7 @@ func (b *LocalBackend) loadStateLocked(key ipn.StateKey, prefs *ipn.Prefs) (err 
 // setAtomicValuesFromPrefs populates sshAtomicBool and containsViaIPFuncAtomic
 // from the prefs p, which may be nil.
 func (b *LocalBackend) setAtomicValuesFromPrefs(p *ipn.Prefs) {
-	b.sshAtomicBool.Set(p != nil && p.RunSSH && canSSH)
+	b.sshAtomicBool.Store(p != nil && p.RunSSH && canSSH)
 
 	if p == nil {
 		b.containsViaIPFuncAtomic.Store(tsaddr.NewContainsIPFunc(nil))
@@ -2525,8 +2525,7 @@ func (b *LocalBackend) TailscaleVarRoot() string {
 	}
 	switch runtime.GOOS {
 	case "ios", "android", "darwin":
-		dir, _ := paths.AppSharedDir.Load().(string)
-		return dir
+		return paths.AppSharedDir.Load()
 	}
 	return ""
 }
@@ -3053,13 +3052,13 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	b.setAtomicValuesFromPrefs(nil)
 }
 
-func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Get() && canSSH }
+func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && canSSH }
 
 // ShouldHandleViaIP reports whether whether ip is an IPv6 address in the
 // Tailscale ULA's v6 "via" range embedding an IPv4 address to be forwarded to
 // by Tailscale.
 func (b *LocalBackend) ShouldHandleViaIP(ip netip.Addr) bool {
-	if f, ok := b.containsViaIPFuncAtomic.Load().(func(netip.Addr) bool); ok {
+	if f, ok := b.containsViaIPFuncAtomic.LoadOk(); ok {
 		return f(ip)
 	}
 	return false

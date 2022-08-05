@@ -264,7 +264,7 @@ type Conn struct {
 
 	// stunReceiveFunc holds the current STUN packet processing func.
 	// Its Loaded value is always non-nil.
-	stunReceiveFunc atomic.Value // of func(p []byte, fromAddr *net.UDPAddr)
+	stunReceiveFunc syncs.AtomicValue[func(p []byte, fromAddr netip.AddrPort)]
 
 	// derpRecvCh is used by receiveDERP to read DERP messages.
 	// It must have buffer size > 0; see issue 3736.
@@ -286,21 +286,21 @@ type Conn struct {
 	// is named negatively because in early start-up, we don't yet
 	// necessarily have a netcheck.Report and don't want to skip
 	// logging.
-	noV4, noV6 syncs.AtomicBool
+	noV4, noV6 atomic.Bool
 
 	// noV4Send is whether IPv4 UDP is known to be unable to transmit
 	// at all. This could happen if the socket is in an invalid state
 	// (as can happen on darwin after a network link status change).
-	noV4Send syncs.AtomicBool
+	noV4Send atomic.Bool
 
 	// networkUp is whether the network is up (some interface is up
 	// with IPv4 or IPv6). It's used to suppress log spam and prevent
 	// new connection that'll fail.
-	networkUp syncs.AtomicBool
+	networkUp atomic.Bool
 
 	// havePrivateKey is whether privateKey is non-zero.
-	havePrivateKey  syncs.AtomicBool
-	publicKeyAtomic atomic.Value // of key.NodePublic (or NodeKey zero value if !havePrivateKey)
+	havePrivateKey  atomic.Bool
+	publicKeyAtomic syncs.AtomicValue[key.NodePublic] // or NodeKey zero value if !havePrivateKey
 
 	// derpMapAtomic is the same as derpMap, but without requiring
 	// sync.Mutex. For use with NewRegionClient's callback, to avoid
@@ -310,7 +310,7 @@ type Conn struct {
 	lastNetCheckReport atomic.Pointer[netcheck.Report]
 
 	// port is the preferred port from opts.Port; 0 means auto.
-	port syncs.AtomicUint32
+	port atomic.Uint32
 
 	// ============================================================
 	// mu guards all following fields; see userspaceEngine lock
@@ -531,7 +531,7 @@ func newConn() *Conn {
 	}
 	c.bind = &connBind{Conn: c, closed: true}
 	c.muCond = sync.NewCond(&c.mu)
-	c.networkUp.Set(true) // assume up until told otherwise
+	c.networkUp.Store(true) // assume up until told otherwise
 	return c
 }
 
@@ -542,7 +542,7 @@ func newConn() *Conn {
 // It doesn't start doing anything until Start is called.
 func NewConn(opts Options) (*Conn, error) {
 	c := newConn()
-	c.port.Set(uint32(opts.Port))
+	c.port.Store(uint32(opts.Port))
 	c.logf = opts.logf()
 	c.epFunc = opts.endpointsFunc()
 	c.derpActiveFunc = opts.derpActiveFunc()
@@ -634,7 +634,7 @@ func (c *Conn) updateEndpoints(why string) {
 		c.muCond.Broadcast()
 	}()
 	c.logf("[v1] magicsock: starting endpoint update (%s)", why)
-	if c.noV4Send.Get() && runtime.GOOS != "js" {
+	if c.noV4Send.Load() && runtime.GOOS != "js" {
 		c.mu.Lock()
 		closed := c.closed
 		c.mu.Unlock()
@@ -736,9 +736,9 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	}
 
 	c.lastNetCheckReport.Store(report)
-	c.noV4.Set(!report.IPv4)
-	c.noV6.Set(!report.IPv6)
-	c.noV4Send.Set(!report.IPv4CanSend)
+	c.noV4.Store(!report.IPv4)
+	c.noV6.Store(!report.IPv6)
+	c.noV4Send.Store(!report.IPv4CanSend)
 
 	ni := &tailcfg.NetInfo{
 		DERPLatency:           map[string]float64{},
@@ -757,6 +757,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	}
 	ni.WorkingIPv6.Set(report.IPv6)
 	ni.WorkingUDP.Set(report.UDP)
+	ni.WorkingICMPv4.Set(report.ICMPv4)
 	ni.PreferredDERP = report.PreferredDERP
 
 	if ni.PreferredDERP == 0 {
@@ -1074,7 +1075,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		// port mapping on their router to the same explicit
 		// port that tailscaled is running with. Worst case
 		// it's an invalid candidate mapping.
-		if port := c.port.Get(); nr.MappingVariesByDestIP.EqualBool(true) && port != 0 {
+		if port := c.port.Load(); nr.MappingVariesByDestIP.EqualBool(true) && port != 0 {
 			if ip, _, err := net.SplitHostPort(nr.GlobalV4); err == nil {
 				addAddr(ipp(net.JoinHostPort(ip, strconv.Itoa(int(port)))), tailcfg.EndpointSTUN4LocalPort)
 			}
@@ -1167,7 +1168,7 @@ func (c *Conn) LocalPort() uint16 {
 
 var errNetworkDown = errors.New("magicsock: network down")
 
-func (c *Conn) networkDown() bool { return !c.networkUp.Get() }
+func (c *Conn) networkDown() bool { return !c.networkUp.Load() }
 
 func (c *Conn) Send(b []byte, ep conn.Endpoint) error {
 	metricSendData.Add(1)
@@ -1207,7 +1208,7 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 	switch {
 	case addr.Addr().Is4():
 		_, err = c.pconn4.WriteToUDPAddrPort(b, addr)
-		if err != nil && (c.noV4.Get() || neterror.TreatAsLostUDP(err)) {
+		if err != nil && (c.noV4.Load() || neterror.TreatAsLostUDP(err)) {
 			return false, nil
 		}
 	case addr.Addr().Is6():
@@ -1216,7 +1217,7 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 			return false, nil
 		}
 		_, err = c.pconn6.WriteToUDPAddrPort(b, addr)
-		if err != nil && (c.noV6.Get() || neterror.TreatAsLostUDP(err)) {
+		if err != nil && (c.noV6.Load() || neterror.TreatAsLostUDP(err)) {
 			return false, nil
 		}
 	default:
@@ -1668,13 +1669,13 @@ func (c *Conn) receiveIPv4(b []byte) (n int, ep conn.Endpoint, err error) {
 // caller).
 func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) (ep *endpoint, ok bool) {
 	if stun.Is(b) {
-		c.stunReceiveFunc.Load().(func([]byte, netip.AddrPort))(b, ipp)
+		c.stunReceiveFunc.Load()(b, ipp)
 		return nil, false
 	}
 	if c.handleDiscoMessage(b, ipp, key.NodePublic{}) {
 		return nil, false
 	}
-	if !c.havePrivateKey.Get() {
+	if !c.havePrivateKey.Load() {
 		// If we have no private key, we're logged out or
 		// stopped. Don't try to pass these wireguard packets
 		// up to wireguard-go; it'll just complain (issue 1167).
@@ -2140,12 +2141,12 @@ func (c *Conn) discoInfoLocked(k key.DiscoPublic) *discoInfo {
 func (c *Conn) SetNetworkUp(up bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.networkUp.Get() == up {
+	if c.networkUp.Load() == up {
 		return
 	}
 
 	c.logf("magicsock: SetNetworkUp(%v)", up)
-	c.networkUp.Set(up)
+	c.networkUp.Store(up)
 
 	if up {
 		c.startDerpHomeConnectLocked()
@@ -2157,10 +2158,10 @@ func (c *Conn) SetNetworkUp(up bool) {
 
 // SetPreferredPort sets the connection's preferred local port.
 func (c *Conn) SetPreferredPort(port uint16) {
-	if uint16(c.port.Get()) == port {
+	if uint16(c.port.Load()) == port {
 		return
 	}
-	c.port.Set(uint32(port))
+	c.port.Store(uint32(port))
 
 	if err := c.rebind(dropCurrentPort); err != nil {
 		c.logf("%w", err)
@@ -2185,7 +2186,7 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 		return nil
 	}
 	c.privateKey = newKey
-	c.havePrivateKey.Set(!newKey.IsZero())
+	c.havePrivateKey.Store(!newKey.IsZero())
 
 	if newKey.IsZero() {
 		c.publicKeyAtomic.Store(key.NodePublic{})
@@ -2835,7 +2836,7 @@ func (c *Conn) bindSocket(rucPtr **RebindingUDPConn, network string, curPortFate
 	// Second best is the port that is currently in use.
 	// If those fail, fall back to 0.
 	var ports []uint16
-	if port := uint16(c.port.Get()); port != 0 {
+	if port := uint16(c.port.Load()); port != 0 {
 		ports = append(ports, port)
 	}
 	if ruc.pconn != nil && curPortFate == keepCurrentPort {
@@ -2979,10 +2980,8 @@ type RebindingUDPConn struct {
 	// check pconn (after acquiring mu) to see if there's been a rebind
 	// meanwhile.
 	// pconn isn't really needed, but makes some of the code simpler
-	// to keep it in a type safe form. TODO(bradfitz): really we should make a generic
-	// atomic.Value. Unfortunately Go 1.19's atomic.Pointer[T] is only for pointers,
-	// not interfaces.
-	pconnAtomic atomic.Value // of nettype.PacketConn
+	// to keep it in a type safe form.
+	pconnAtomic syncs.AtomicValue[nettype.PacketConn]
 
 	mu    sync.Mutex // held while changing pconn (and pconnAtomic)
 	pconn nettype.PacketConn
@@ -3004,7 +3003,7 @@ func (c *RebindingUDPConn) currentConn() nettype.PacketConn {
 // It returns the number of bytes copied and the source address.
 func (c *RebindingUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
-		pconn := c.pconnAtomic.Load().(nettype.PacketConn)
+		pconn := c.pconnAtomic.Load()
 		n, addr, err := pconn.ReadFrom(b)
 		if err != nil && pconn != c.currentConn() {
 			continue
@@ -3022,7 +3021,7 @@ func (c *RebindingUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 // when c's underlying connection is a net.UDPConn.
 func (c *RebindingUDPConn) ReadFromNetaddr(b []byte) (n int, ipp netip.AddrPort, err error) {
 	for {
-		pconn := c.pconnAtomic.Load().(nettype.PacketConn)
+		pconn := c.pconnAtomic.Load()
 
 		// Optimization: Treat *net.UDPConn specially.
 		// This lets us avoid allocations by calling ReadFromUDPAddrPort.
@@ -3081,7 +3080,7 @@ func (c *RebindingUDPConn) closeLocked() error {
 
 func (c *RebindingUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	for {
-		pconn := c.pconnAtomic.Load().(nettype.PacketConn)
+		pconn := c.pconnAtomic.Load()
 
 		n, err := pconn.WriteTo(b, addr)
 		if err != nil {
@@ -3095,7 +3094,7 @@ func (c *RebindingUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 func (c *RebindingUDPConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
 	for {
-		pconn := c.pconnAtomic.Load().(nettype.PacketConn)
+		pconn := c.pconnAtomic.Load()
 
 		n, err := pconn.WriteToUDPAddrPort(b, addr)
 		if err != nil {
@@ -3643,10 +3642,9 @@ func (de *endpoint) removeSentPingLocked(txid stun.TxID, sp sentPing) {
 // The caller should use de.discoKey as the discoKey argument.
 // It is passed in so that sendDiscoPing doesn't need to lock de.mu.
 func (de *endpoint) sendDiscoPing(ep netip.AddrPort, discoKey key.DiscoPublic, txid stun.TxID, logLevel discoLogLevel) {
-	selfPubKey, _ := de.c.publicKeyAtomic.Load().(key.NodePublic)
 	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
-		NodeKey: selfPubKey,
+		NodeKey: de.c.publicKeyAtomic.Load(),
 	}, logLevel)
 	if !sent {
 		de.forgetPing(txid)
